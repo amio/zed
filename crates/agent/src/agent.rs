@@ -16,7 +16,12 @@ use context_server::ContextServerId;
 pub use db::*;
 use itertools::Itertools;
 pub use native_agent_server::NativeAgentServer;
+use parking_lot::Mutex;
 pub use pattern_extraction::*;
+pub use sandboxing::{
+    ThreadSandbox, sandbox_worktree_writable_paths, settings_sandbox_policy,
+    settings_thread_sandbox,
+};
 pub use shell_command_parser::extract_commands;
 pub use templates::*;
 pub use thread::*;
@@ -26,14 +31,14 @@ pub use tools::*;
 
 use acp_thread::{
     AcpThread, AgentModelId, AgentModelSelector, AgentSessionInfo, AgentSessionList,
-    AgentSessionListRequest, AgentSessionListResponse, TokenUsageRatio, UserMessageId,
+    AgentSessionListRequest, AgentSessionListResponse, ClientUserMessageId, TokenUsageRatio,
 };
-use agent_client_protocol::schema as acp;
+use agent_client_protocol::schema::v1 as acp;
 use agent_skills::{
     AGENTS_DIR_NAME, MAX_SKILL_DESCRIPTIONS_SIZE, MAX_SKILL_FILE_SIZE, ProjectSkillGroup,
-    SKILL_FILE_NAME, Skill, SkillIndex, SkillLoadError, SkillScopeId, SkillSource, SkillSummary,
-    builtin_skills, global_skills_dir, load_skills_from_directory, parse_skill_frontmatter,
-    project_skills_relative_path, read_skill_body_from_content,
+    SKILL_FILE_NAME, Skill, SkillIndex, SkillLoadError, SkillLoadWarning, SkillScopeId,
+    SkillSource, SkillSummary, builtin_skills, global_skills_dir, load_skills_from_directory,
+    parse_skill_frontmatter, project_skills_relative_path, read_skill_body_from_content,
 };
 use anyhow::{Context as _, Result, anyhow};
 use chrono::{DateTime, Utc};
@@ -56,15 +61,30 @@ use project::{
     trusted_worktrees::TrustedWorktrees,
 };
 use prompt_store::{ProjectContext, RULES_FILE_NAMES, RulesFileContext, WorktreeContext};
+use rand::Rng as _;
 use serde::{Deserialize, Serialize};
 use settings::{LanguageModelSelection, Settings as _, update_settings_file};
 use std::any::Any;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 use util::ResultExt;
 use util::path_list::PathList;
 use util::rel_path::RelPath;
+
+const MAXIMUM_RETRY_JITTER_FRACTION: f64 = 0.1;
+
+pub(crate) fn jitter_retry_delay(delay: Duration) -> Duration {
+    let jitter = delay.mul_f64(rand::rng().random_range(0.0..MAXIMUM_RETRY_JITTER_FRACTION));
+    delay.checked_add(jitter).unwrap_or(Duration::MAX)
+}
+
+#[cfg(test)]
+pub(crate) fn maximum_retry_delay_with_jitter(delay: Duration) -> Duration {
+    let maximum_jitter = delay.mul_f64(MAXIMUM_RETRY_JITTER_FRACTION);
+    delay.checked_add(maximum_jitter).unwrap_or(Duration::MAX)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProjectSnapshot {
@@ -76,21 +96,67 @@ pub struct RulesLoadingError {
     pub message: SharedString,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SkillLoadingIssueKind {
+    LoadFailed,
+    DescriptionTooLong,
+    CatalogBudgetExceeded,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct SkillLoadingError {
+pub struct SkillLoadingIssue {
     pub project_id: EntityId,
     pub path: PathBuf,
     pub message: SharedString,
+    pub kind: SkillLoadingIssueKind,
 }
 
-/// Emitted whenever the set of skill loading errors for a project changes.
-/// The `errors` field is the full replacement list; subscribers should treat
-/// it as a snapshot rather than appending. An empty `errors` list means all
-/// previously-reported errors have been resolved.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SkillLoadingIssueData {
+    path: PathBuf,
+    message: String,
+    kind: SkillLoadingIssueKind,
+}
+
+impl SkillLoadingIssueData {
+    fn from_load_error(error: SkillLoadError) -> Self {
+        Self {
+            path: error.path,
+            message: error.message,
+            kind: SkillLoadingIssueKind::LoadFailed,
+        }
+    }
+
+    fn from_load_warning(skill: &Skill, warning: &SkillLoadWarning) -> Self {
+        let kind = match warning {
+            SkillLoadWarning::DescriptionTooLong { .. } => {
+                SkillLoadingIssueKind::DescriptionTooLong
+            }
+        };
+        Self {
+            path: skill.skill_file_path.clone(),
+            message: warning.message(),
+            kind,
+        }
+    }
+
+    fn catalog_budget_exceeded(path: PathBuf, message: String) -> Self {
+        Self {
+            path,
+            message,
+            kind: SkillLoadingIssueKind::CatalogBudgetExceeded,
+        }
+    }
+}
+
+/// Emitted whenever the set of skill loading issues for a project changes.
+/// The `issues` field is the full replacement list; subscribers should treat
+/// it as a snapshot rather than appending. An empty `issues` list means all
+/// previously-reported issues have been resolved.
 #[derive(Clone, Debug)]
-pub struct SkillLoadingErrorsUpdated {
+pub struct SkillLoadingIssuesUpdated {
     pub project_id: EntityId,
-    pub errors: Vec<SkillLoadingError>,
+    pub issues: Vec<SkillLoadingIssue>,
 }
 
 #[derive(Clone, Debug)]
@@ -99,6 +165,7 @@ pub struct NativeAvailableSkill {
     pub description: String,
     pub source: SharedString,
     pub skill_file_path: PathBuf,
+    pub warning: Option<SharedString>,
 }
 
 impl From<&Skill> for NativeAvailableSkill {
@@ -108,19 +175,52 @@ impl From<&Skill> for NativeAvailableSkill {
             description: skill.description.clone(),
             source: skill.source.display_label().to_string().into(),
             skill_file_path: skill.skill_file_path.clone(),
+            warning: skill
+                .load_warnings
+                .first()
+                .map(|warning| warning.message().into()),
         }
     }
+}
+
+pub const COMPACT_COMMAND_NAME: &str = "compact";
+
+/// Returns the set of MCP prompt names that must be server-qualified
+/// (`/<server>.<name>`) to stay unambiguous in the slash-command popup: names
+/// shared by more than one MCP prompt, or names colliding with a reserved
+/// built-in command (e.g. `/compact`). A built-in always wins an unqualified
+/// invocation, so colliding MCP prompts are only reachable when prefixed.
+fn ambiguous_mcp_prompt_names<'a>(
+    reserved: impl IntoIterator<Item = &'a str>,
+    prompt_names: impl IntoIterator<Item = &'a str>,
+) -> HashSet<&'a str> {
+    let mut counts: HashMap<&str, usize> = HashMap::default();
+    for name in reserved.into_iter().chain(prompt_names) {
+        *counts.entry(name).or_insert(0) += 1;
+    }
+    counts
+        .into_iter()
+        .filter_map(|(name, count)| (count > 1).then_some(name))
+        .collect()
 }
 
 struct ProjectState {
     project: Entity<Project>,
     project_context: Entity<ProjectContext>,
     skills: Arc<Vec<Skill>>,
-    skill_loading_errors: Vec<SkillLoadingError>,
+    skill_loading_issues: Vec<SkillLoadingIssue>,
     project_context_needs_refresh: watch::Sender<()>,
     _maintain_project_context: Task<Result<()>>,
     context_server_registry: Entity<ContextServerRegistry>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// A thread snapshot captured for persistence. Building it clones the thread's
+/// messages (cheap `Arc` clones) so the background save can serialize without
+/// racing the foreground mutation of the live thread.
+struct PendingThreadSave {
+    folder_paths: PathList,
+    db_thread: Task<DbThread>,
 }
 
 /// Holds both the internal Thread and the AcpThread for a session
@@ -128,16 +228,28 @@ struct Session {
     /// The internal thread that processes messages
     thread: Entity<Thread>,
     /// The ACP thread that handles protocol communication
-    acp_thread: Entity<acp_thread::AcpThread>,
+    acp_thread: WeakEntity<acp_thread::AcpThread>,
+    subagents: Vec<Entity<acp_thread::AcpThread>>,
     project_id: EntityId,
-    pending_save: Task<Result<()>>,
+    /// Latest snapshot to persist. Overwritten in place on every save request;
+    /// the single save worker drains it, coalescing bursts into one write.
+    pending_save: Arc<Mutex<Option<PendingThreadSave>>>,
+    save_wake: watch::Sender<()>,
+    save_worker: Task<Result<()>>,
     _subscriptions: Vec<Subscription>,
-    ref_count: usize,
+}
+
+impl Session {
+    fn draft_prompt(&self, cx: &App) -> Option<Vec<acp::ContentBlock>> {
+        match self.acp_thread.upgrade() {
+            Some(acp_thread) => acp_thread.read(cx).draft_prompt().map(Vec::from),
+            None => self.thread.read(cx).draft_prompt().map(Vec::from),
+        }
+    }
 }
 
 struct PendingSession {
     task: Shared<Task<Result<Entity<AcpThread>, Arc<anyhow::Error>>>>,
-    ref_count: usize,
 }
 
 pub struct LanguageModels {
@@ -216,6 +328,10 @@ impl LanguageModels {
         self.refresh_models_rx.clone()
     }
 
+    pub fn notify_model_selection_changed(&mut self) {
+        self.refresh_models_tx.send(()).ok();
+    }
+
     pub fn model_from_id(&self, model_id: &AgentModelId) -> Option<Arc<dyn LanguageModel>> {
         self.models.get(model_id).cloned()
     }
@@ -234,6 +350,7 @@ impl LanguageModels {
             }),
             is_latest: model.is_latest(),
             cost: model.model_cost_info().map(|cost| cost.to_shared_string()),
+            disabled: model.is_disabled(),
         }
     }
 
@@ -293,7 +410,10 @@ impl LanguageModels {
                 }
             }
 
-            cx.update(language_models::update_environment_fallback_model);
+            cx.update(|cx| {
+                LanguageModelRegistry::global(cx)
+                    .update(cx, |registry, cx| registry.refresh_fallback_model(cx))
+            });
         })
     }
 }
@@ -357,23 +477,27 @@ enum SkillsState {
     Watching,
 }
 
-impl gpui::EventEmitter<SkillLoadingErrorsUpdated> for NativeAgent {}
+impl gpui::EventEmitter<SkillLoadingIssuesUpdated> for NativeAgent {}
 
 static RULES_FILE_REL_PATHS: LazyLock<Vec<Arc<RelPath>>> = LazyLock::new(|| {
     RULES_FILE_NAMES
         .iter()
-        .filter_map(|name| RelPath::unix(name).ok().map(|path| path.into_arc()))
+        .filter_map(|name| {
+            RelPath::from_unix_str(name)
+                .ok()
+                .map(|path| path.into_arc())
+        })
         .collect()
 });
 
 static AGENTS_PREFIX: LazyLock<Option<Arc<RelPath>>> = LazyLock::new(|| {
-    RelPath::unix(AGENTS_DIR_NAME)
+    RelPath::from_unix_str(AGENTS_DIR_NAME)
         .ok()
         .map(|path| path.into_arc())
 });
 
 static SKILLS_PREFIX: LazyLock<Option<Arc<RelPath>>> = LazyLock::new(|| {
-    RelPath::unix(project_skills_relative_path())
+    RelPath::from_unix_str(project_skills_relative_path())
         .ok()
         .map(|path| path.into_arc())
 });
@@ -408,7 +532,7 @@ async fn expand_project_skills_directories(
     worktree: &Entity<Worktree>,
     cx: &mut AsyncApp,
 ) -> Result<()> {
-    let agents_dir = RelPath::unix(AGENTS_DIR_NAME)?;
+    let agents_dir = RelPath::from_unix_str(AGENTS_DIR_NAME)?;
     let Some(skills_prefix) = SKILLS_PREFIX.as_ref() else {
         return Ok(());
     };
@@ -434,7 +558,7 @@ fn project_skill_files_from_worktree(worktree: &Worktree) -> Vec<ProjectSkillFil
     let Some(skills_prefix) = SKILLS_PREFIX.as_ref() else {
         return Vec::new();
     };
-    let Ok(skill_file_name) = RelPath::unix(SKILL_FILE_NAME) else {
+    let Ok(skill_file_name) = RelPath::from_unix_str(SKILL_FILE_NAME) else {
         return Vec::new();
     };
 
@@ -454,7 +578,7 @@ fn project_skill_files_from_worktree(worktree: &Worktree) -> Vec<ProjectSkillFil
 
         skill_files.push(ProjectSkillFile {
             display_path: worktree.absolutize(&relative_path),
-            relative_path,
+            relative_path: relative_path.into(),
             size: skill_file.size,
         });
     }
@@ -477,10 +601,15 @@ impl NativeAgent {
         log::debug!("Creating new NativeAgent");
 
         cx.new(|cx| {
-            let subscriptions = vec![cx.subscribe(
-                &LanguageModelRegistry::global(cx),
-                Self::handle_models_updated_event,
-            )];
+            let subscriptions = vec![
+                cx.subscribe(
+                    &LanguageModelRegistry::global(cx),
+                    Self::handle_models_updated_event,
+                ),
+                // Flush thread content on quit so an in-flight async save
+                // can't leave a thread orphaned ("no thread found with ID").
+                cx.on_app_quit(Self::flush_threads_on_quit),
+            ];
 
             if !cx.has_global::<SkillIndex>() {
                 cx.set_global(SkillIndex::default());
@@ -655,14 +784,13 @@ impl NativeAgent {
             )
         });
 
-        self.register_session(thread, project_id, 1, cx)
+        self.register_session(thread, project_id, cx)
     }
 
     fn register_session(
         &mut self,
         thread_handle: Entity<Thread>,
         project_id: EntityId,
-        ref_count: usize,
         cx: &mut Context<Self>,
     ) -> Entity<AcpThread> {
         let connection = Rc::new(NativeAgentConnection(cx.entity()));
@@ -727,17 +855,47 @@ impl NativeAgent {
             cx.observe(&thread_handle, move |this, thread, cx| {
                 this.save_thread(thread, cx)
             }),
+            cx.observe_release(&acp_thread, {
+                let session_id = session_id.clone();
+                let acp_thread_id = acp_thread.entity_id();
+                move |this, released_acp_thread, cx| {
+                    let draft_prompt = released_acp_thread.draft_prompt().map(Vec::from);
+                    this.release_session(&session_id, acp_thread_id, draft_prompt, cx);
+                }
+            }),
         ];
+
+        let (save_wake, save_wake_rx) = watch::channel(());
+        let pending_save: Arc<Mutex<Option<PendingThreadSave>>> = Arc::new(Mutex::new(None));
+        let database_future = ThreadsDatabase::connect(cx);
+        let thread_store = self.thread_store.clone();
+        let save_worker = cx.spawn({
+            let pending_save = pending_save.clone();
+            let session_id = session_id.clone();
+            async move |_this, cx| {
+                Self::run_save_worker(
+                    session_id,
+                    save_wake_rx,
+                    pending_save,
+                    database_future,
+                    thread_store,
+                    cx,
+                )
+                .await
+            }
+        });
 
         self.sessions.insert(
             session_id,
             Session {
                 thread: thread_handle,
-                acp_thread: acp_thread.clone(),
+                acp_thread: acp_thread.downgrade(),
+                subagents: Vec::new(),
                 project_id,
+                pending_save,
+                save_wake,
+                save_worker,
                 _subscriptions: subscriptions,
-                pending_save: Task::ready(Ok(())),
-                ref_count,
             },
         );
 
@@ -816,7 +974,7 @@ impl NativeAgent {
                 project,
                 project_context,
                 skills: Arc::new(Vec::new()),
-                skill_loading_errors: Vec::new(),
+                skill_loading_issues: Vec::new(),
                 project_context_needs_refresh: project_context_needs_refresh_tx,
                 _maintain_project_context: cx.spawn(async move |this, cx| {
                     Self::maintain_project_context(
@@ -857,34 +1015,35 @@ impl NativeAgent {
                     cx,
                 ))
             })??;
-            let (project_context, skills, skill_errors) = task.await;
+            let (project_context, skills, skill_issue_data) = task.await;
             let skills = Arc::new(skills);
-            let skill_loading_errors: Vec<SkillLoadingError> = skill_errors
+            let skill_loading_issues: Vec<SkillLoadingIssue> = skill_issue_data
                 .into_iter()
-                .map(|skill_error| SkillLoadingError {
+                .map(|issue| SkillLoadingIssue {
                     project_id,
-                    path: skill_error.path,
-                    message: skill_error.message.into(),
+                    path: issue.path,
+                    message: issue.message.into(),
+                    kind: issue.kind,
                 })
                 .collect();
             this.update(cx, |this, cx| {
-                // Only emit SkillLoadingErrorsUpdated when the error list
+                // Only emit SkillLoadingIssuesUpdated when the issue list
                 // actually changed. Refreshes happen frequently (prompt-store
                 // updates, rules-file edits, worktree events, trust-state
                 // changes), and re-emitting an unchanged list causes the UI
-                // to redisplay errors the user has already dismissed.
+                // to redisplay issues the user has already dismissed.
                 // Transitions from non-empty to empty still count as a change,
                 // so subscribers continue to receive an empty list to clear
-                // previously-displayed errors when they get resolved.
-                let errors_changed = this
+                // previously-displayed issues when they get resolved.
+                let issues_changed = this
                     .projects
                     .get(&project_id)
-                    .map(|state| state.skill_loading_errors != skill_loading_errors)
+                    .map(|state| state.skill_loading_issues != skill_loading_issues)
                     .unwrap_or(true);
 
                 if let Some(state) = this.projects.get_mut(&project_id) {
                     state.skills = skills;
-                    state.skill_loading_errors = skill_loading_errors.clone();
+                    state.skill_loading_issues = skill_loading_issues.clone();
                     // Only push the new `ProjectContext` through if it
                     // differs from the current one. The system prompt is
                     // re-rendered from this on every turn, so an unchanged
@@ -903,10 +1062,10 @@ impl NativeAgent {
                             }
                         });
                 }
-                if errors_changed {
-                    cx.emit(SkillLoadingErrorsUpdated {
+                if issues_changed {
+                    cx.emit(SkillLoadingIssuesUpdated {
                         project_id,
-                        errors: skill_loading_errors,
+                        issues: skill_loading_issues,
                     });
                 }
                 // Skills appear in the slash-command list, so a change in
@@ -926,7 +1085,7 @@ impl NativeAgent {
         project: &Entity<Project>,
         fs: Arc<dyn Fs>,
         cx: &mut App,
-    ) -> Task<(ProjectContext, Vec<Skill>, Vec<SkillLoadError>)> {
+    ) -> Task<(ProjectContext, Vec<Skill>, Vec<SkillLoadingIssueData>)> {
         let worktrees = project.read(cx).visible_worktrees(cx).collect::<Vec<_>>();
         let worktree_tasks = worktrees
             .iter()
@@ -1085,8 +1244,20 @@ impl NativeAgent {
             // model-facing catalog.
             let global_skills = global_skills_task.await;
             let project_skills_results = project_skills_task.await;
-            let (skills, mut skill_errors) =
+            let (skills, skill_errors) =
                 combine_skills(global_skills, project_skills_results.into_iter().flatten());
+            let mut skill_issues = skill_errors
+                .into_iter()
+                .map(SkillLoadingIssueData::from_load_error)
+                .collect::<Vec<_>>();
+            for skill in &skills {
+                skill_issues.extend(
+                    skill
+                        .load_warnings
+                        .iter()
+                        .map(|warning| SkillLoadingIssueData::from_load_warning(skill, warning)),
+                );
+            }
 
             // Apply project-overrides-global before catalog selection
             // so the model sees at most one entry per name. The full
@@ -1095,13 +1266,13 @@ impl NativeAgent {
             let overridden = apply_skill_overrides(&skills);
 
             // Enforce the catalog size budget here so that skills which
-            // don't fit produce a load error in the UI rather than being
+            // don't fit produce an issue in the UI rather than being
             // silently swallowed by ProjectContext.
-            let (catalog_skills, budget_errors) = select_catalog_skills(&overridden);
-            skill_errors.extend(budget_errors);
+            let (catalog_skills, budget_issues) = select_catalog_skills(&overridden);
+            skill_issues.extend(budget_issues);
 
             let project_context = ProjectContext::new(worktrees).with_skills(catalog_skills);
-            (project_context, skills, skill_errors)
+            (project_context, skills, skill_issues)
         })
     }
 
@@ -1203,7 +1374,7 @@ impl NativeAgent {
         };
 
         let thread = thread.downgrade();
-        let acp_thread = session.acp_thread.downgrade();
+        let acp_thread = session.acp_thread.clone();
         cx.spawn(async move |_, cx| {
             let title = thread.read_with(cx, |thread, _| thread.title())?;
             if let Some(title) = title {
@@ -1225,9 +1396,12 @@ impl NativeAgent {
         let Some(session) = self.sessions.get(thread.read(cx).id()) else {
             return;
         };
-        session.acp_thread.update(cx, |acp_thread, cx| {
-            acp_thread.update_token_usage(usage.0.clone(), cx);
-        });
+        session
+            .acp_thread
+            .update(cx, |acp_thread, cx| {
+                acp_thread.update_token_usage(usage.0.clone(), cx);
+            })
+            .ok();
     }
 
     fn handle_project_event(
@@ -1275,12 +1449,8 @@ impl NativeAgent {
 
         for session in self.sessions.values_mut() {
             session.thread.update(cx, |thread, cx| {
-                if thread.model().is_none()
-                    && let Some(model) = default_model.clone()
-                {
-                    thread.set_model(model, cx);
-                    cx.notify();
-                }
+                thread.ensure_model(default_model.as_ref(), cx);
+
                 if let Some(model) = summarization_model.clone() {
                     if thread.summarization_model().is_none()
                         || matches!(event, language_model::Event::ThreadSummaryModelChanged)
@@ -1384,16 +1554,19 @@ impl NativeAgent {
             if session.project_id != project_id {
                 continue;
             }
-            session.acp_thread.update(cx, |thread, cx| {
-                thread
-                    .handle_session_update(
-                        acp::SessionUpdate::AvailableCommandsUpdate(
-                            acp::AvailableCommandsUpdate::new(available_commands.clone()),
-                        ),
-                        cx,
-                    )
-                    .log_err();
-            });
+            session
+                .acp_thread
+                .update(cx, |thread, cx| {
+                    thread
+                        .handle_session_update(
+                            acp::SessionUpdate::AvailableCommandsUpdate(
+                                acp::AvailableCommandsUpdate::new(available_commands.clone()),
+                            ),
+                            cx,
+                        )
+                        .log_err();
+                })
+                .ok();
         }
     }
 
@@ -1402,25 +1575,30 @@ impl NativeAgent {
         cx: &App,
     ) -> Vec<acp::AvailableCommand> {
         let Some(state) = project_state else {
-            return vec![];
+            return Vec::new();
         };
+        let compact_command = acp::AvailableCommand::new(
+            COMPACT_COMMAND_NAME,
+            "Summarize the conversation so far to free up context",
+        )
+        .meta(acp_thread::meta_with_command_category(
+            acp_thread::CommandCategory::Native,
+        ));
+
         let registry = state.context_server_registry.read(cx);
 
-        let mut prompt_name_counts: HashMap<&str, usize> = HashMap::default();
-        for context_server_prompt in registry.prompts() {
-            *prompt_name_counts
-                .entry(context_server_prompt.prompt.name.as_str())
-                .or_insert(0) += 1;
-        }
+        // Reserve the built-in command name so a same-named MCP prompt is
+        // force-prefixed (`/<server>.compact`) and stays reachable: an
+        // unqualified `/compact` always routes to the native command.
+        let ambiguous_prompt_names = ambiguous_mcp_prompt_names(
+            [COMPACT_COMMAND_NAME],
+            registry.prompts().map(|p| p.prompt.name.as_str()),
+        );
 
         let mcp_commands = registry.prompts().flat_map(|context_server_prompt| {
             let prompt = &context_server_prompt.prompt;
 
-            let should_prefix = prompt_name_counts
-                .get(prompt.name.as_str())
-                .copied()
-                .unwrap_or(0)
-                > 1;
+            let should_prefix = ambiguous_prompt_names.contains(prompt.name.as_str());
 
             let name = if should_prefix {
                 format!("{}.{}", context_server_prompt.server_id, prompt.name)
@@ -1429,7 +1607,10 @@ impl NativeAgent {
             };
 
             let mut command =
-                acp::AvailableCommand::new(name, prompt.description.clone().unwrap_or_default());
+                acp::AvailableCommand::new(name, prompt.description.clone().unwrap_or_default())
+                    .meta(acp_thread::meta_with_command_category(
+                        acp_thread::CommandCategory::Mcp,
+                    ));
 
             match prompt.arguments.as_deref() {
                 Some([arg]) => {
@@ -1449,7 +1630,9 @@ impl NativeAgent {
             Some(command)
         });
 
-        mcp_commands.collect()
+        std::iter::once(compact_command)
+            .chain(mcp_commands)
+            .collect()
     }
 
     pub fn load_thread(
@@ -1499,13 +1682,16 @@ impl NativeAgent {
         project: Entity<Project>,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<AcpThread>>> {
-        if let Some(session) = self.sessions.get_mut(&id) {
-            session.ref_count += 1;
-            return Task::ready(Ok(session.acp_thread.clone()));
+        if let Some(session) = self.sessions.get(&id) {
+            if let Some(acp_thread) = session.acp_thread.upgrade() {
+                return Task::ready(Ok(acp_thread));
+            }
+            let acp_thread_id = session.acp_thread.entity_id();
+            let draft_prompt = session.draft_prompt(cx);
+            self.release_session(&id, acp_thread_id, draft_prompt, cx);
         }
 
-        if let Some(pending) = self.pending_sessions.get_mut(&id) {
-            pending.ref_count += 1;
+        if let Some(pending) = self.pending_sessions.get(&id) {
             let task = pending.task.clone();
             return cx.background_spawn(async move { task.await.map_err(|err| anyhow!(err)) });
         }
@@ -1528,11 +1714,8 @@ impl NativeAgent {
                     let acp_thread = this
                         .update(cx, |this, cx| {
                             let project_id = this.get_or_create_project_state(&project, cx);
-                            let ref_count = this
-                                .pending_sessions
-                                .remove(&id)
-                                .map_or(1, |pending| pending.ref_count);
-                            this.register_session(thread.clone(), project_id, ref_count, cx)
+                            this.pending_sessions.remove(&id);
+                            this.register_session(thread.clone(), project_id, cx)
                         })
                         .map_err(Arc::new)?;
                     let events = thread.update(cx, |thread, cx| thread.replay(cx));
@@ -1540,6 +1723,7 @@ impl NativeAgent {
                         NativeAgentConnection::handle_thread_events(
                             events,
                             acp_thread.downgrade(),
+                            None,
                             cx,
                         )
                     })
@@ -1556,7 +1740,6 @@ impl NativeAgent {
             id,
             PendingSession {
                 task: shared_task.clone(),
-                ref_count: 1,
             },
         );
 
@@ -1576,65 +1759,128 @@ impl NativeAgent {
                 .update(cx, |this, cx| {
                     this.sessions
                         .get(&id)
-                        .unwrap()
+                        .context("session released before summary")?
                         .thread
-                        .update(cx, |thread, cx| thread.summary(cx))
-                })?
+                        .update(cx, |thread, cx| anyhow::Ok(thread.summary(cx)))
+                })??
                 .await
                 .context("Failed to generate summary")?;
 
-            this.update(cx, |this, cx| this.close_session(&id, cx))?
-                .await?;
             drop(acp_thread);
             Ok(result)
         })
     }
 
-    fn close_session(
+    fn release_session(
         &mut self,
         session_id: &acp::SessionId,
+        acp_thread_id: EntityId,
+        draft_prompt: Option<Vec<acp::ContentBlock>>,
         cx: &mut Context<Self>,
-    ) -> Task<Result<()>> {
-        let Some(session) = self.sessions.get_mut(session_id) else {
-            return Task::ready(Ok(()));
+    ) {
+        let Some(session) = self.sessions.get(session_id) else {
+            return;
         };
-
-        session.ref_count -= 1;
-        if session.ref_count > 0 {
-            return Task::ready(Ok(()));
+        if session.acp_thread.entity_id() != acp_thread_id {
+            return;
         }
 
-        let thread = session.thread.clone();
-        self.save_thread(thread, cx);
+        self.enqueue_save(session_id, draft_prompt, cx);
         let Some(session) = self.sessions.remove(session_id) else {
-            return Task::ready(Ok(()));
+            return;
         };
         let project_id = session.project_id;
+        session.save_worker.detach_and_log_err(cx);
 
         let has_remaining = self.sessions.values().any(|s| s.project_id == project_id);
         if !has_remaining {
             self.projects.remove(&project_id);
             self.publish_skill_index(cx);
         }
-
-        session.pending_save
     }
 
     fn save_thread(&mut self, thread: Entity<Thread>, cx: &mut Context<Self>) {
-        if thread.read(cx).is_empty() {
-            return;
-        }
-
         let id = thread.read(cx).id().clone();
+        let Some(session) = self.sessions.get(&id) else {
+            return;
+        };
+        let draft_prompt = session.draft_prompt(cx);
+        self.enqueue_save(&id, draft_prompt, cx);
+    }
+
+    fn enqueue_save(
+        &mut self,
+        id: &acp::SessionId,
+        draft_prompt: Option<Vec<acp::ContentBlock>>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self.sessions.get(id) else {
+            return;
+        };
+        let Some((id, folder_paths, db_thread)) =
+            self.thread_save_payload(session, draft_prompt, cx)
+        else {
+            return;
+        };
+
         let Some(session) = self.sessions.get_mut(&id) else {
             return;
         };
+        *session.pending_save.lock() = Some(PendingThreadSave {
+            folder_paths,
+            db_thread,
+        });
+        session.save_wake.send(()).log_err();
+    }
 
-        let project_id = session.project_id;
-        let Some(state) = self.projects.get(&project_id) else {
-            return;
-        };
+    async fn run_save_worker(
+        id: acp::SessionId,
+        mut wake: watch::Receiver<()>,
+        pending_save: Arc<Mutex<Option<PendingThreadSave>>>,
+        database_future: Shared<Task<Result<Arc<ThreadsDatabase>, Arc<anyhow::Error>>>>,
+        thread_store: Entity<ThreadStore>,
+        cx: &mut AsyncApp,
+    ) -> Result<()> {
+        loop {
+            let closed = wake.changed().await.is_err();
+            let payload = pending_save.lock().take();
+            if let Some(PendingThreadSave {
+                folder_paths,
+                db_thread,
+            }) = payload
+                && let Some(database) = database_future
+                    .clone()
+                    .await
+                    .map_err(|err| anyhow!(err))
+                    .log_err()
+            {
+                let db_thread = db_thread.await;
+                database
+                    .save_thread(id.clone(), db_thread, folder_paths)
+                    .await
+                    .log_err();
+                thread_store.update(cx, |store, cx| store.reload(cx));
+            }
+            if closed {
+                break;
+            }
+        }
+        Ok(())
+    }
 
+    /// Builds everything needed to persist a session's thread content,
+    /// capturing the current draft prompt from the ACP thread. Returns `None`
+    /// if the thread is empty or its project state is gone.
+    fn thread_save_payload(
+        &self,
+        session: &Session,
+        draft_prompt: Option<Vec<acp::ContentBlock>>,
+        cx: &mut App,
+    ) -> Option<(acp::SessionId, PathList, Task<DbThread>)> {
+        if session.thread.read(cx).is_empty() {
+            return None;
+        }
+        let state = self.projects.get(&session.project_id)?;
         let folder_paths = PathList::new(
             &state
                 .project
@@ -1643,31 +1889,51 @@ impl NativeAgent {
                 .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
                 .collect::<Vec<_>>(),
         );
-
-        let draft_prompt = session.acp_thread.read(cx).draft_prompt().map(Vec::from);
-        let database_future = ThreadsDatabase::connect(cx);
-        let db_thread = thread.update(cx, |thread, cx| {
+        let id = session.thread.read(cx).id().clone();
+        let db_thread = session.thread.update(cx, |thread, cx| {
             thread.set_draft_prompt(draft_prompt);
             thread.to_db(cx)
         });
-        let thread_store = self.thread_store.clone();
-        session.pending_save = cx.spawn(async move |_, cx| {
+        Some((id, folder_paths, db_thread))
+    }
+
+    /// Commits every non-empty thread's content on shutdown so the async
+    /// `save_thread` losing the race can't leave metadata without content.
+    fn flush_threads_on_quit(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> impl Future<Output = ()> + use<> {
+        let database_future = ThreadsDatabase::connect(cx);
+
+        let mut saves = Vec::new();
+        for session in self.sessions.values() {
+            let draft_prompt = session.draft_prompt(cx);
+            saves.extend(self.thread_save_payload(session, draft_prompt, cx));
+        }
+
+        async move {
             let Some(database) = database_future.await.map_err(|err| anyhow!(err)).log_err() else {
-                return Ok(());
+                return;
             };
-            let db_thread = db_thread.await;
-            database
-                .save_thread(id, db_thread, folder_paths)
-                .await
-                .log_err();
-            thread_store.update(cx, |store, cx| store.reload(cx));
-            Ok(())
-        });
+            // All quit observers share `gpui::SHUTDOWN_TIMEOUT`, so run the
+            // saves concurrently instead of one at a time.
+            future::join_all(saves.into_iter().map(|(id, folder_paths, db_thread)| {
+                let database = database.clone();
+                async move {
+                    let db_thread = db_thread.await;
+                    database
+                        .save_thread(id, db_thread, folder_paths)
+                        .await
+                        .log_err();
+                }
+            }))
+            .await;
+        }
     }
 
     fn send_mcp_prompt(
         &self,
-        message_id: UserMessageId,
+        client_user_message_id: ClientUserMessageId,
         session_id: acp::SessionId,
         prompt_name: String,
         server_id: ContextServerId,
@@ -1694,14 +1960,18 @@ impl NativeAgent {
                     .sessions
                     .get(&session_id)
                     .context("Failed to get session")?;
-                anyhow::Ok((session.acp_thread.clone(), session.thread.clone()))
+                let acp_thread = session
+                    .acp_thread
+                    .upgrade()
+                    .context("Session was released")?;
+                anyhow::Ok((acp_thread, session.thread.clone()))
             })??;
 
             let mut last_is_user = true;
 
             thread.update(cx, |thread, cx| {
                 thread.push_acp_user_block(
-                    message_id,
+                    client_user_message_id,
                     original_content.into_iter().skip(1),
                     path_style,
                     cx,
@@ -1714,7 +1984,7 @@ impl NativeAgent {
 
                 match role {
                     context_server::types::Role::User => {
-                        let id = acp_thread::UserMessageId::new();
+                        let id = acp_thread::ClientUserMessageId::new();
 
                         acp_thread.update(cx, |acp_thread, cx| {
                             acp_thread.push_user_content_block_with_indent(
@@ -1757,10 +2027,52 @@ impl NativeAgent {
                 }
             })?;
 
+            let connection = this.upgrade().map(NativeAgentConnection);
             cx.update(|cx| {
                 NativeAgentConnection::handle_thread_events(
                     response_stream,
                     acp_thread.downgrade(),
+                    connection,
+                    cx,
+                )
+            })
+            .await
+        })
+    }
+
+    /// Run a summary-based context compaction in response to the built-in
+    /// `/compact` slash command.
+    fn send_compact_command(
+        &self,
+        client_user_message_id: ClientUserMessageId,
+        session_id: acp::SessionId,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<acp::PromptResponse>> {
+        cx.spawn(async move |this, cx| {
+            let (acp_thread, thread) = this.update(cx, |this, _cx| {
+                let session = this
+                    .sessions
+                    .get(&session_id)
+                    .context("Failed to get session")?;
+                let acp_thread = session
+                    .acp_thread
+                    .upgrade()
+                    .context("Session was released")?;
+                anyhow::Ok((acp_thread, session.thread.clone()))
+            })??;
+
+            let response_stream =
+                thread.update(cx, |thread, cx| thread.compact(client_user_message_id, cx))?;
+            acp_thread.update(cx, |acp_thread, cx| {
+                acp_thread.update_token_usage(None, cx);
+            });
+
+            let connection = this.upgrade().map(NativeAgentConnection);
+            cx.update(|cx| {
+                NativeAgentConnection::handle_thread_events(
+                    response_stream,
+                    acp_thread.downgrade(),
+                    connection,
                     cx,
                 )
             })
@@ -1778,7 +2090,7 @@ impl NativeAgent {
     /// instructions followed by the user's request.
     fn send_skill_invocation(
         &self,
-        message_id: UserMessageId,
+        client_user_message_id: ClientUserMessageId,
         session_id: acp::SessionId,
         skill: Skill,
         original_content: Vec<acp::ContentBlock>,
@@ -1797,7 +2109,11 @@ impl NativeAgent {
                     .sessions
                     .get(&session_id)
                     .context("Failed to get session")?;
-                anyhow::Ok((session.acp_thread.clone(), session.thread.clone()))
+                let acp_thread = session
+                    .acp_thread
+                    .upgrade()
+                    .context("Session was released")?;
+                anyhow::Ok((acp_thread, session.thread.clone()))
             })??;
 
             // Build the model-context message: skill envelope first, then
@@ -1837,7 +2153,7 @@ impl NativeAgent {
             // the user can see what context was loaded for the skill. The
             // user's own typed message is already rendered by the normal
             // prompt flow, so we don't push it to the UI again here.
-            let injected_id = acp_thread::UserMessageId::new();
+            let injected_id = acp_thread::ClientUserMessageId::new();
             acp_thread.update(cx, |acp_thread, cx| {
                 acp_thread.push_user_content_block_with_indent(
                     Some(injected_id),
@@ -1854,15 +2170,17 @@ impl NativeAgent {
             combined.extend(user_blocks);
 
             thread.update(cx, |thread, cx| {
-                thread.push_acp_user_block(message_id, combined, path_style, cx);
+                thread.push_acp_user_block(client_user_message_id, combined, path_style, cx);
             });
 
             let response_stream = thread.update(cx, |thread, cx| thread.send_existing(cx))?;
 
+            let connection = this.upgrade().map(NativeAgentConnection);
             cx.update(|cx| {
                 NativeAgentConnection::handle_thread_events(
                     response_stream,
                     acp_thread.downgrade(),
+                    connection,
                     cx,
                 )
             })
@@ -1940,10 +2258,8 @@ impl NativeAgentConnection {
         + FnOnce(Entity<Thread>, &mut App) -> Result<mpsc::UnboundedReceiver<Result<ThreadEvent>>>,
     ) -> Task<Result<acp::PromptResponse>> {
         let Some((thread, acp_thread)) = self.0.update(cx, |agent, _cx| {
-            agent
-                .sessions
-                .get_mut(&session_id)
-                .map(|s| (s.thread.clone(), s.acp_thread.clone()))
+            let session = agent.sessions.get(&session_id)?;
+            Some((session.thread.clone(), session.acp_thread.clone()))
         }) else {
             log::error!("Session not found in run_turn: {}", session_id);
             return Task::ready(Err(anyhow!("Session not found")));
@@ -1954,12 +2270,13 @@ impl NativeAgentConnection {
             Ok(stream) => stream,
             Err(err) => return Task::ready(Err(err)),
         };
-        Self::handle_thread_events(response_stream, acp_thread.downgrade(), cx)
+        Self::handle_thread_events(response_stream, acp_thread, Some(self.clone()), cx)
     }
 
     fn handle_thread_events(
         mut events: mpsc::UnboundedReceiver<Result<ThreadEvent>>,
         acp_thread: WeakEntity<AcpThread>,
+        connection: Option<NativeAgentConnection>,
         cx: &App,
     ) -> Task<Result<acp::PromptResponse>> {
         cx.spawn(async move |cx| {
@@ -2004,18 +2321,75 @@ impl NativeAgentConnection {
                                     )
                                 })??;
                                 cx.background_spawn(async move {
-                                    if let acp_thread::RequestPermissionOutcome::Selected(outcome) =
-                                        outcome_task.await
-                                    {
-                                        response
-                                            .send(outcome)
-                                            .map_err(|_| {
-                                                anyhow!("authorization receiver was dropped")
-                                            })
-                                            .log_err();
-                                    }
+                                    let outcome = match outcome_task.await {
+                                        acp_thread::RequestPermissionOutcome::Selected(outcome) => outcome,
+                                        acp_thread::RequestPermissionOutcome::InterruptedByFollowUp => {
+                                            acp_thread::SelectedPermissionOutcome::new(
+                                                acp::PermissionOptionId::new(
+                                                    FOLLOW_UP_PERMISSION_DENIED_OPTION_ID,
+                                                ),
+                                                acp::PermissionOptionKind::RejectOnce,
+                                            )
+                                        }
+                                        acp_thread::RequestPermissionOutcome::Cancelled => return,
+                                    };
+                                    response
+                                        .send(outcome)
+                                        .map_err(|_| anyhow!("authorization receiver was dropped"))
+                                        .log_err();
                                 })
                                 .detach();
+                            }
+                            ThreadEvent::ToolCallAuthorizationResolved {
+                                tool_call_id,
+                                outcome,
+                            } => {
+                                acp_thread.update(cx, |thread, cx| {
+                                    thread.authorize_tool_call(tool_call_id, outcome, cx);
+                                })?;
+                            }
+                            ThreadEvent::Elicitation(ElicitationRequest {
+                                tool_call_id,
+                                message,
+                                schema,
+                                response,
+                            }) => {
+                                let request_result = acp_thread.update(cx, |thread, cx| {
+                                    let scope = acp::ElicitationSessionScope::new(
+                                        thread.session_id().clone(),
+                                    )
+                                    .tool_call_id(tool_call_id);
+                                    let request = acp::CreateElicitationRequest::new(
+                                        acp::ElicitationFormMode::new(scope, schema),
+                                        message,
+                                    );
+                                    thread.request_elicitation(request, cx)
+                                })?;
+                                match request_result {
+                                    Ok(response_task) => {
+                                        cx.background_spawn(async move {
+                                            let elicitation_response = response_task.await;
+                                            response
+                                                .send(elicitation_response)
+                                                .map_err(|_| {
+                                                    anyhow!("elicitation receiver was dropped")
+                                                })
+                                                .log_err();
+                                        })
+                                        .detach();
+                                    }
+                                    Err(error) => {
+                                        log::error!("Failed to request elicitation: {error:?}");
+                                        // Resolve the tool's pending request so it
+                                        // doesn't hang waiting on a form that will
+                                        // never render.
+                                        response
+                                            .send(acp::CreateElicitationResponse::new(
+                                                acp::ElicitationAction::Cancel,
+                                            ))
+                                            .ok();
+                                    }
+                                }
                             }
                             ThreadEvent::ToolCall(tool_call) => {
                                 acp_thread.update(cx, |thread, cx| {
@@ -2027,22 +2401,35 @@ impl NativeAgentConnection {
                                     thread.update_tool_call(update, cx)
                                 })??;
                             }
-                            ThreadEvent::Plan(plan) => {
-                                acp_thread.update(cx, |thread, cx| thread.update_plan(plan, cx))?;
-                            }
                             ThreadEvent::SubagentSpawned(session_id) => {
                                 acp_thread.update(cx, |thread, cx| {
                                     thread.subagent_spawned(session_id, cx);
                                 })?;
                             }
                             ThreadEvent::Retry(status) => {
+                                if acp_thread::refusal_fallback_model_from_meta(&status.meta)
+                                    .is_some()
+                                {
+                                    if let Some(connection) = &connection {
+                                        cx.update(|cx| {
+                                            connection.0.update(cx, |agent, _| {
+                                                agent.models.notify_model_selection_changed();
+                                            });
+                                        });
+                                    }
+                                }
                                 acp_thread.update(cx, |thread, cx| {
                                     thread.update_retry_status(status, cx)
                                 })?;
                             }
-                            ThreadEvent::ContextCompaction => {
+                            ThreadEvent::ContextCompaction(compaction) => {
                                 acp_thread.update(cx, |thread, cx| {
-                                    thread.push_context_compaction(cx);
+                                    thread.push_context_compaction(compaction, cx);
+                                })?;
+                            }
+                            ThreadEvent::ContextCompactionUpdate(update) => {
+                                acp_thread.update(cx, |thread, cx| {
+                                    thread.update_context_compaction(update, cx);
                                 })?;
                             }
                             ThreadEvent::Stop(stop_reason) => {
@@ -2081,6 +2468,12 @@ struct Command<'a> {
 }
 
 impl<'a> Command<'a> {
+    fn is_unqualified(&self, prompt_name: &str) -> bool {
+        self.prompt_name == prompt_name
+            && self.explicit_server_id.is_none()
+            && self.skill_scope.is_none()
+    }
+
     fn parse(prompt: &'a [acp::ContentBlock]) -> Option<Self> {
         let acp::ContentBlock::Text(text_content) = prompt.first()? else {
             return None;
@@ -2367,19 +2760,6 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
             .update(cx, |agent, cx| agent.open_thread(session_id, project, cx))
     }
 
-    fn supports_close_session(&self) -> bool {
-        true
-    }
-
-    fn close_session(
-        self: Rc<Self>,
-        session_id: &acp::SessionId,
-        cx: &mut App,
-    ) -> Task<Result<()>> {
-        self.0
-            .update(cx, |agent, cx| agent.close_session(session_id, cx))
-    }
-
     fn auth_methods(&self) -> &[acp::AuthMethod] {
         &[] // No auth for in-process
     }
@@ -2395,9 +2775,101 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
         }) as Rc<dyn AgentModelSelector>)
     }
 
+    fn client_user_message_ids(
+        &self,
+        _cx: &App,
+    ) -> Option<Rc<dyn acp_thread::AgentSessionClientUserMessageIds>> {
+        let prompt: Rc<dyn acp_thread::AgentSessionClientUserMessageIds> = Rc::new(self.clone());
+        Some(prompt)
+    }
+
     fn prompt(
         &self,
-        id: acp_thread::UserMessageId,
+        params: acp::PromptRequest,
+        cx: &mut App,
+    ) -> Task<Result<acp::PromptResponse>> {
+        acp_thread::AgentSessionClientUserMessageIds::prompt(
+            self,
+            acp_thread::AgentSessionClientUserMessageIds::new_id(self),
+            params,
+            cx,
+        )
+    }
+
+    fn retry(
+        &self,
+        session_id: &acp::SessionId,
+        _cx: &App,
+    ) -> Option<Rc<dyn acp_thread::AgentSessionRetry>> {
+        Some(Rc::new(NativeAgentSessionRetry {
+            connection: self.clone(),
+            session_id: session_id.clone(),
+        }) as _)
+    }
+
+    fn cancel(&self, session_id: &acp::SessionId, cx: &mut App) {
+        log::info!("Cancelling on session: {}", session_id);
+        self.0.update(cx, |agent, cx| {
+            if let Some(session) = agent.sessions.get(session_id) {
+                session
+                    .thread
+                    .update(cx, |thread, cx| thread.cancel(cx))
+                    .detach();
+            }
+        });
+    }
+
+    fn truncate(
+        &self,
+        session_id: &acp::SessionId,
+        cx: &App,
+    ) -> Option<Rc<dyn acp_thread::AgentSessionTruncate>> {
+        self.0.read_with(cx, |agent, _cx| {
+            agent.sessions.get(session_id).map(|session| {
+                Rc::new(NativeAgentSessionTruncate {
+                    thread: session.thread.clone(),
+                    acp_thread: session.acp_thread.clone(),
+                }) as _
+            })
+        })
+    }
+
+    fn set_title(
+        &self,
+        session_id: &acp::SessionId,
+        cx: &App,
+    ) -> Option<Rc<dyn acp_thread::AgentSessionSetTitle>> {
+        self.0.read_with(cx, |agent, _cx| {
+            agent
+                .sessions
+                .get(session_id)
+                .filter(|s| !s.thread.read(cx).is_subagent())
+                .map(|session| {
+                    Rc::new(NativeAgentSessionSetTitle {
+                        thread: session.thread.clone(),
+                    }) as _
+                })
+        })
+    }
+
+    fn session_list(&self, cx: &mut App) -> Option<Rc<dyn AgentSessionList>> {
+        let thread_store = self.0.read(cx).thread_store.clone();
+        Some(Rc::new(NativeAgentSessionList::new(thread_store, cx)) as _)
+    }
+
+    fn telemetry(&self) -> Option<Rc<dyn acp_thread::AgentTelemetry>> {
+        Some(Rc::new(self.clone()) as Rc<dyn acp_thread::AgentTelemetry>)
+    }
+
+    fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
+        self
+    }
+}
+
+impl acp_thread::AgentSessionClientUserMessageIds for NativeAgentConnection {
+    fn prompt(
+        &self,
+        client_user_message_id: acp_thread::ClientUserMessageId,
         params: acp::PromptRequest,
         cx: &mut App,
     ) -> Task<Result<acp::PromptResponse>> {
@@ -2417,6 +2889,12 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
         };
 
         if let Some(parsed_command) = Command::parse(&params.prompt) {
+            if parsed_command.is_unqualified(COMPACT_COMMAND_NAME) {
+                return self.0.update(cx, |agent, cx| {
+                    agent.send_compact_command(client_user_message_id, session_id, cx)
+                });
+            }
+
             // Skill scope qualifiers (`/:<name>` and
             // `/<worktree>:<name>`) use a colon separator that can't
             // collide with MCP's `/<server>.<name>` grammar. The popup
@@ -2430,7 +2908,13 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
             {
                 let skill = skill.clone();
                 return self.0.update(cx, |agent, cx| {
-                    agent.send_skill_invocation(id, session_id.clone(), skill, params.prompt, cx)
+                    agent.send_skill_invocation(
+                        client_user_message_id,
+                        session_id.clone(),
+                        skill,
+                        params.prompt,
+                        cx,
+                    )
                 });
             }
 
@@ -2465,7 +2949,7 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
 
                 return self.0.update(cx, |agent, cx| {
                     agent.send_mcp_prompt(
-                        id,
+                        client_user_message_id,
                         session_id.clone(),
                         prompt_name,
                         server_id,
@@ -2513,7 +2997,7 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
                     let skill = skill.clone();
                     return self.0.update(cx, |agent, cx| {
                         agent.send_skill_invocation(
-                            id,
+                            client_user_message_id,
                             session_id.clone(),
                             skill,
                             params.prompt,
@@ -2533,80 +3017,13 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
                 .map(|block| UserMessageContent::from_content_block(block, path_style))
                 .collect::<Vec<_>>();
             log::debug!("Converted prompt to message: {} chars", content.len());
-            log::debug!("Message id: {:?}", id);
+            log::debug!("Client user message id: {:?}", client_user_message_id);
             log::debug!("Message content: {:?}", content);
 
-            thread.update(cx, |thread, cx| thread.send(id, content, cx))
-        })
-    }
-
-    fn retry(
-        &self,
-        session_id: &acp::SessionId,
-        _cx: &App,
-    ) -> Option<Rc<dyn acp_thread::AgentSessionRetry>> {
-        Some(Rc::new(NativeAgentSessionRetry {
-            connection: self.clone(),
-            session_id: session_id.clone(),
-        }) as _)
-    }
-
-    fn cancel(&self, session_id: &acp::SessionId, cx: &mut App) {
-        log::info!("Cancelling on session: {}", session_id);
-        self.0.update(cx, |agent, cx| {
-            if let Some(session) = agent.sessions.get(session_id) {
-                session
-                    .thread
-                    .update(cx, |thread, cx| thread.cancel(cx))
-                    .detach();
-            }
-        });
-    }
-
-    fn truncate(
-        &self,
-        session_id: &acp::SessionId,
-        cx: &App,
-    ) -> Option<Rc<dyn acp_thread::AgentSessionTruncate>> {
-        self.0.read_with(cx, |agent, _cx| {
-            agent.sessions.get(session_id).map(|session| {
-                Rc::new(NativeAgentSessionTruncate {
-                    thread: session.thread.clone(),
-                    acp_thread: session.acp_thread.downgrade(),
-                }) as _
+            thread.update(cx, |thread, cx| {
+                thread.send(client_user_message_id, content, cx)
             })
         })
-    }
-
-    fn set_title(
-        &self,
-        session_id: &acp::SessionId,
-        cx: &App,
-    ) -> Option<Rc<dyn acp_thread::AgentSessionSetTitle>> {
-        self.0.read_with(cx, |agent, _cx| {
-            agent
-                .sessions
-                .get(session_id)
-                .filter(|s| !s.thread.read(cx).is_subagent())
-                .map(|session| {
-                    Rc::new(NativeAgentSessionSetTitle {
-                        thread: session.thread.clone(),
-                    }) as _
-                })
-        })
-    }
-
-    fn session_list(&self, cx: &mut App) -> Option<Rc<dyn AgentSessionList>> {
-        let thread_store = self.0.read(cx).thread_store.clone();
-        Some(Rc::new(NativeAgentSessionList::new(thread_store, cx)) as _)
-    }
-
-    fn telemetry(&self) -> Option<Rc<dyn acp_thread::AgentTelemetry>> {
-        Some(Rc::new(self.clone()) as Rc<dyn acp_thread::AgentTelemetry>)
-    }
-
-    fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
-        self
     }
 }
 
@@ -2671,7 +3088,7 @@ impl AgentSessionList for NativeAgentSessionList {
         Task::ready(Ok(AgentSessionListResponse::new(sessions)))
     }
 
-    fn supports_delete(&self, _cx: &App) -> bool {
+    fn supports_delete(&self) -> bool {
         true
     }
 
@@ -2709,9 +3126,13 @@ struct NativeAgentSessionTruncate {
 }
 
 impl acp_thread::AgentSessionTruncate for NativeAgentSessionTruncate {
-    fn run(&self, message_id: acp_thread::UserMessageId, cx: &mut App) -> Task<Result<()>> {
+    fn run(
+        &self,
+        client_user_message_id: acp_thread::ClientUserMessageId,
+        cx: &mut App,
+    ) -> Task<Result<()>> {
         match self.thread.update(cx, |thread, cx| {
-            thread.truncate(message_id.clone(), cx)?;
+            thread.truncate(client_user_message_id.clone(), cx)?;
             Ok(thread.latest_token_usage())
         }) {
             Ok(usage) => {
@@ -2795,7 +3216,13 @@ impl NativeThreadEnvironment {
                     .get(&parent_session_id)
                     .map(|s| s.project_id)
                     .context("parent session not found")?;
-                Ok(agent.register_session(subagent_thread.clone(), project_id, 1, cx))
+                let acp_thread = agent.register_session(subagent_thread.clone(), project_id, cx);
+                let parent_session = agent
+                    .sessions
+                    .get_mut(&parent_session_id)
+                    .context("parent session not found")?;
+                parent_session.subagents.push(acp_thread.clone());
+                Ok(acp_thread)
             })??;
 
         let depth = current_depth + 1;
@@ -2821,7 +3248,11 @@ impl NativeThreadEnvironment {
                 .sessions
                 .get(&session_id)
                 .ok_or_else(|| anyhow!("No subagent session found with id {session_id}"))?;
-            anyhow::Ok((session.thread.clone(), session.acp_thread.clone()))
+            let acp_thread = session
+                .acp_thread
+                .upgrade()
+                .ok_or_else(|| anyhow!("Subagent session {session_id} was released"))?;
+            anyhow::Ok((session.thread.clone(), acp_thread))
         })??;
 
         let depth = subagent_thread.read(cx).depth();
@@ -2867,49 +3298,67 @@ impl ThreadEnvironment for NativeThreadEnvironment {
         sandbox_wrap: Option<acp_thread::SandboxWrap>,
         cx: &mut AsyncApp,
     ) -> Task<Result<Rc<dyn TerminalHandle>>> {
-        // Use a per-thread temp directory for all terminal commands, even when
-        // sandboxing is disabled, so the model can't infer sandbox state from
-        // `$TMPDIR` changing between conversations.
+        // On Seatbelt-style sandboxes (macOS) there's no tmpfs overlay, so to
+        // give the command a writable temp area we point `$TMPDIR`/`$TMP`/
+        // `$TEMP` at a per-thread directory inside the sandbox's writable
+        // scope. Doing this even when sandboxing is disabled keeps `$TMPDIR`
+        // stable so the model can't infer sandbox state from it.
         //
         // Only do this for local projects. For remote projects the temp
         // directory would be created on the client, but the terminal runs on
         // the remote host, so pointing `$TMPDIR` (and the sandbox writable
         // scope) at a client-side path would leak client environment into the
         // remote terminal and reference a directory that doesn't exist there.
+        //
+        // Linux and Windows are excluded: the bwrap sandbox (run directly on
+        // Linux, and via WSL on Windows) already mounts a fresh, writable
+        // `tmpfs` over `/tmp`, so the environment looks like a normal
+        // filesystem with no special `$TMPDIR` (which would only make the
+        // sandbox more obviously Zed-specific). On Windows a per-thread
+        // `$TMPDIR` would also be a Windows path that's meaningless inside
+        // WSL, and adding it to the writable scope would bind a stray
+        // `/mnt/<drive>/...` path.
+        #[cfg_attr(any(target_os = "linux", target_os = "windows"), allow(unused_mut))]
         let mut extra_env = extra_env;
+        #[cfg_attr(any(target_os = "linux", target_os = "windows"), allow(unused_mut))]
         let mut sandbox_wrap = sandbox_wrap;
-        let temp_dir = self.thread.update(cx, |thread, cx| {
-            thread
-                .project()
-                .read(cx)
-                .is_local()
-                .then(|| thread.sandboxed_terminal_temp_dir(cx))
-        });
-        match temp_dir {
-            Ok(Some(Ok(temp_dir))) => {
-                // Canonicalize so the path matches what the sandbox resolves
-                // symlinks to (e.g. `/var` -> `/private/var` on macOS).
-                // `$TMPDIR` and the writable-scope entry below must agree, and
-                // they must agree with the path the kernel actually checks.
-                let temp_dir = temp_dir.canonicalize().unwrap_or(temp_dir);
-                let temp_dir_string = temp_dir.to_string_lossy().into_owned();
-                extra_env.extend([
-                    acp::EnvVariable::new("TMPDIR", &temp_dir_string),
-                    acp::EnvVariable::new("TMP", &temp_dir_string),
-                    acp::EnvVariable::new("TEMP", &temp_dir_string),
-                ]);
-                // The command's `$TMPDIR` must live inside the sandbox's
-                // writable scope. The per-thread temp directory is owned here
-                // (not in the terminal tool that assembles the rest of the
-                // writable set), so add it whenever the command is sandboxed.
-                if let Some(sandbox_wrap) = &mut sandbox_wrap {
-                    sandbox_wrap.writable_paths.push(temp_dir);
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        {
+            let temp_dir = self.thread.update(cx, |thread, cx| {
+                thread
+                    .project()
+                    .read(cx)
+                    .is_local()
+                    .then(|| thread.sandboxed_terminal_temp_dir(cx))
+            });
+            match temp_dir {
+                Ok(Some(Ok(temp_dir))) => {
+                    // Canonicalize so the path matches what the sandbox
+                    // resolves symlinks to (e.g. `/var` -> `/private/var` on
+                    // macOS). `$TMPDIR` and the writable-scope entry below must
+                    // agree, and they must agree with the path the kernel
+                    // actually checks.
+                    let temp_dir = temp_dir.canonicalize().unwrap_or(temp_dir);
+                    let temp_dir_string = temp_dir.to_string_lossy().into_owned();
+                    extra_env.extend([
+                        acp::EnvVariable::new("TMPDIR", &temp_dir_string),
+                        acp::EnvVariable::new("TMP", &temp_dir_string),
+                        acp::EnvVariable::new("TEMP", &temp_dir_string),
+                    ]);
+                    // The command's `$TMPDIR` must live inside the sandbox's
+                    // writable scope. The per-thread temp directory is owned
+                    // here (not in the terminal tool that assembles the rest
+                    // of the writable set), so add it whenever the command is
+                    // sandboxed.
+                    if let Some(sandbox_wrap) = &mut sandbox_wrap {
+                        sandbox_wrap.writable_paths.push(temp_dir);
+                    }
                 }
-            }
-            Ok(None) => {}
-            Ok(Some(Err(error))) => return Task::ready(Err(error)),
-            Err(error) => return Task::ready(Err(error)),
-        };
+                Ok(None) => {}
+                Ok(Some(Err(error))) => return Task::ready(Err(error)),
+                Err(error) => return Task::ready(Err(error)),
+            };
+        }
         let task = self.acp_thread.update(cx, |thread, cx| {
             thread.create_terminal(
                 command,
@@ -3188,9 +3637,9 @@ impl TerminalHandle for AcpTerminalHandle {
 /// Returns `SkillSummary` values rather than full `Skill`s so that the
 /// (potentially ~100KB) skill bodies aren't cloned just to be discarded by
 /// `ProjectContext::new`, which only needs the summary fields.
-fn select_catalog_skills(skills: &[Skill]) -> (Vec<SkillSummary>, Vec<SkillLoadError>) {
+fn select_catalog_skills(skills: &[Skill]) -> (Vec<SkillSummary>, Vec<SkillLoadingIssueData>) {
     let mut kept = Vec::new();
-    let mut errors = Vec::new();
+    let mut issues = Vec::new();
     let mut dropped: Vec<&Skill> = Vec::new();
     let mut total_size = 0usize;
     let mut budget_exceeded = false;
@@ -3243,13 +3692,13 @@ fn select_catalog_skills(skills: &[Skill]) -> (Vec<SkillSummary>, Vec<SkillLoadE
             }
             message
         };
-        errors.push(SkillLoadError {
-            path: first.skill_file_path.clone(),
+        issues.push(SkillLoadingIssueData::catalog_budget_exceeded(
+            first.skill_file_path.clone(),
             message,
-        });
+        ));
     }
 
-    (kept, errors)
+    (kept, issues)
 }
 
 /// Build a closure that, when called, reads the latest `state.skills`
@@ -3417,17 +3866,126 @@ mod internal_tests {
     use std::path::Path;
 
     use super::*;
+    use crate::tests::release_dropped_entities;
     use acp_thread::{AgentConnection, AgentModelGroupName, AgentModelInfo, MentionUri};
+    use agent_settings::COMPACTION_PROMPT;
     use fs::FakeFs;
     use gpui::TestAppContext;
     use indoc::formatdoc;
     use language_model::fake_provider::{FakeLanguageModel, FakeLanguageModelProvider};
     use language_model::{
-        LanguageModelCompletionEvent, LanguageModelProviderId, LanguageModelProviderName,
+        CompletionIntent, LanguageModelCompletionEvent, LanguageModelProviderId,
+        LanguageModelProviderName,
     };
     use serde_json::json;
     use settings::SettingsStore;
     use util::{path, rel_path::rel_path};
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn test_native_terminal_tool_releases_pty_resources(cx: &mut TestAppContext) {
+        use feature_flags::FeatureFlagAppExt as _;
+
+        init_test(cx);
+        cx.executor().allow_parking();
+        cx.update(|cx| {
+            cx.update_flags(true, vec!["sandboxing".to_string()]);
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings.tool_permissions.default = settings::ToolPermissionMode::Confirm;
+            settings.tool_permissions.tools.remove(TerminalTool::NAME);
+            settings.sandbox_permissions = agent_settings::SandboxPermissions::default();
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
+
+        let temp_dir = tempfile::tempdir().expect("create terminal working directory");
+        let fs = fs::RealFs::new(None, cx.executor());
+        let project = Project::test(fs.clone(), [temp_dir.path()], cx).await;
+        let thread_store = cx.new(|cx| ThreadStore::new(cx));
+        let agent = cx.update(|cx| NativeAgent::new(thread_store, Templates::new(), fs, cx));
+        let connection = Rc::new(NativeAgentConnection(agent.clone()));
+        let acp_thread = cx
+            .update(|cx| {
+                connection.new_session(project.clone(), PathList::new(&[temp_dir.path()]), cx)
+            })
+            .await
+            .expect("create native agent session");
+        let session_id = acp_thread.read_with(cx, |thread, _cx| thread.session_id().clone());
+        let thread = cx.update(|cx| native_thread_for_session(&agent, &session_id, cx));
+        let environment = Rc::new(NativeThreadEnvironment {
+            agent: agent.downgrade(),
+            thread: thread.downgrade(),
+            acp_thread: acp_thread.downgrade(),
+        });
+
+        #[allow(clippy::arc_with_non_send_sync)]
+        let tool = Arc::new(SandboxedTerminalTool::new(project, environment));
+        let (event_stream, mut receiver) = ToolCallEventStream::test();
+        let task = cx.update(|cx| {
+            tool.run(
+                ToolInput::resolved(SandboxedTerminalToolInput {
+                    command: "true".to_string(),
+                    cd: temp_dir.path().to_string_lossy().into_owned(),
+                    ..Default::default()
+                }),
+                event_stream,
+                cx,
+            )
+        });
+
+        let authorization = receiver.expect_authorization().await;
+        authorization
+            .response
+            .send(acp_thread::SelectedPermissionOutcome::new(
+                acp::PermissionOptionId::new("allow"),
+                acp::PermissionOptionKind::AllowOnce,
+            ))
+            .expect("authorization response should send");
+
+        let update = receiver.expect_update_fields().await;
+        let terminal_id = update
+            .content
+            .iter()
+            .flatten()
+            .find_map(|content| match content {
+                acp::ToolCallContent::Terminal(terminal) => Some(terminal.terminal_id.clone()),
+                _ => None,
+            })
+            .expect("terminal tool should announce its real terminal");
+        let historical_terminal = acp_thread
+            .read_with(cx, |thread, _cx| thread.terminal(terminal_id.clone()))
+            .expect("terminal should remain available while the tool call is running")
+            .read_with(cx, |terminal, _cx| terminal.inner().clone());
+        assert!(
+            historical_terminal.read_with(cx, |terminal, _cx| terminal.has_active_pty_resources()),
+            "the full terminal tool path should create a real PTY"
+        );
+
+        let result = task.await.expect("native terminal tool call succeeds");
+        assert!(
+            result.contains("Command executed successfully."),
+            "unexpected terminal tool result: {result}"
+        );
+        assert!(
+            historical_terminal.read_with(cx, |terminal, _cx| {
+                terminal.is_pty() && terminal.pid_getter().is_some()
+            }),
+            "completed terminal history should retain PTY process metadata"
+        );
+        assert!(
+            !historical_terminal.read_with(cx, |terminal, _cx| terminal.has_active_pty_resources()),
+            "completed terminal history should not retain active PTY resources"
+        );
+
+        cx.run_until_parked();
+        assert!(
+            acp_thread.read_with(cx, |thread, _cx| thread.terminal(terminal_id).is_err()),
+            "the full terminal tool call should release its terminal from the ACP thread"
+        );
+        assert!(
+            !historical_terminal.read_with(cx, |terminal, _cx| terminal.has_active_pty_resources()),
+            "releasing the ACP terminal should keep PTY resources released"
+        );
+    }
 
     fn make_global_skill(name: &str, description: &str) -> Skill {
         Skill {
@@ -3436,9 +3994,268 @@ mod internal_tests {
             source: SkillSource::Global,
             directory_path: PathBuf::from(format!("/home/user/.agents/skills/{name}")),
             skill_file_path: PathBuf::from(format!("/home/user/.agents/skills/{name}/SKILL.md")),
+            load_warnings: Vec::new(),
             disable_model_invocation: false,
             embedded_body: None,
         }
+    }
+
+    async fn setup_native_agent_session(
+        cx: &mut TestAppContext,
+    ) -> (
+        Rc<NativeAgentConnection>,
+        Entity<NativeAgent>,
+        Entity<Project>,
+        Entity<AcpThread>,
+    ) {
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/", json!({ "a": {} })).await;
+        let project = Project::test(fs.clone(), [Path::new("/a")], cx).await;
+        let thread_store = cx.new(|cx| ThreadStore::new(cx));
+        let agent = cx.update(|cx| NativeAgent::new(thread_store, Templates::new(), fs, cx));
+        let connection = Rc::new(NativeAgentConnection(agent.clone()));
+        let acp_thread = cx
+            .update(|cx| {
+                connection.clone().new_session(
+                    project.clone(),
+                    PathList::new(&[Path::new("/a")]),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        (connection, agent, project, acp_thread)
+    }
+
+    fn native_thread_for_session(
+        agent: &Entity<NativeAgent>,
+        session_id: &acp::SessionId,
+        cx: &App,
+    ) -> Entity<Thread> {
+        agent.read_with(cx, |agent, _cx| {
+            agent.sessions.get(session_id).unwrap().thread.clone()
+        })
+    }
+
+    fn request_texts_after_system(
+        messages: &[language_model::LanguageModelRequestMessage],
+    ) -> Vec<String> {
+        messages
+            .iter()
+            .skip(1)
+            .map(language_model::LanguageModelRequestMessage::string_contents)
+            .collect()
+    }
+
+    #[gpui::test]
+    async fn test_compact_command_is_available(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let thread_store = cx.new(|cx| ThreadStore::new(cx));
+        let agent =
+            cx.update(|cx| NativeAgent::new(thread_store, Templates::new(), fs.clone(), cx));
+
+        let connection = NativeAgentConnection(agent.clone());
+        let acp_thread = cx
+            .update(|cx| {
+                Rc::new(connection.clone()).new_session(
+                    project.clone(),
+                    PathList::new(&[Path::new("/")]),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let commands = acp_thread.read(cx).available_commands();
+
+            let compact = commands.iter().find(|command| command.name == "compact");
+            let compact = compact.expect("compact command should be available");
+            assert_eq!(
+                acp_thread::command_category_from_meta(&compact.meta),
+                Some(acp_thread::CommandCategory::Native),
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_compact_prompt_routes_to_manual_compaction(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (connection, agent, project, acp_thread) = setup_native_agent_session(cx).await;
+        let session_id = cx.update(|cx| acp_thread.read(cx).session_id().clone());
+        let thread = cx.update(|cx| native_thread_for_session(&agent, &session_id, cx));
+        let model = Arc::new(FakeLanguageModel::default());
+        let old_message_id = ClientUserMessageId::new();
+
+        cx.update(|cx| {
+            let path_style = project.read(cx).path_style(cx);
+            thread.update(cx, |thread, cx| {
+                thread.set_model(model.clone(), cx);
+                thread.push_acp_user_block(
+                    old_message_id,
+                    [acp::ContentBlock::from("old user")],
+                    path_style,
+                    cx,
+                );
+                thread.push_acp_agent_block("old assistant".into(), cx);
+            });
+        });
+
+        let compact_message_id = ClientUserMessageId::new();
+        let prompt_task = cx.update(|cx| {
+            acp_thread::AgentSessionClientUserMessageIds::prompt(
+                connection.as_ref(),
+                compact_message_id,
+                acp::PromptRequest::new(session_id.clone(), vec!["/compact".into()]),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        let request = model.pending_completions().pop().unwrap();
+        assert_eq!(
+            request.intent,
+            Some(CompletionIntent::ThreadContextSummarization)
+        );
+        assert_eq!(
+            request_texts_after_system(&request.messages),
+            vec![
+                "old user".to_string(),
+                "old assistant".to_string(),
+                COMPACTION_PROMPT.to_string(),
+            ]
+        );
+
+        model.send_completion_stream_text_chunk(&request, "summary");
+        model.end_completion_stream(&request);
+        cx.run_until_parked();
+        prompt_task.await.unwrap();
+    }
+
+    #[gpui::test]
+    async fn test_threads_flushed_to_database_on_app_quit(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let (connection, agent, project, acp_thread) = setup_native_agent_session(cx).await;
+        let session_id = cx.update(|cx| acp_thread.read(cx).session_id().clone());
+        let thread = cx.update(|cx| native_thread_for_session(&agent, &session_id, cx));
+
+        // A second session whose thread stays empty must be skipped by the
+        // quit flush rather than persisted as an empty row.
+        let empty_acp_thread = cx
+            .update(|cx| {
+                connection.clone().new_session(
+                    project.clone(),
+                    PathList::new(&[Path::new("/a")]),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        let empty_session_id = cx.update(|cx| empty_acp_thread.read(cx).session_id().clone());
+
+        // Give the first thread content so it's no longer an empty draft, plus
+        // an in-progress draft prompt that the flush must capture.
+        cx.update(|cx| {
+            let path_style = project.read(cx).path_style(cx);
+            thread.update(cx, |thread, cx| {
+                thread.push_acp_user_block(
+                    ClientUserMessageId::new(),
+                    [acp::ContentBlock::from("hello from the user")],
+                    path_style,
+                    cx,
+                );
+            });
+            acp_thread.update(cx, |acp_thread, cx| {
+                acp_thread
+                    .set_draft_prompt(Some(vec![acp::ContentBlock::from("draft in progress")]), cx);
+            });
+        });
+        cx.run_until_parked();
+
+        // Reproduce the orphaned state from the bug: the sidebar metadata and
+        // serialized panel still reference the session, but the per-session
+        // async content save never landed, so the content row is absent.
+        let database = cx.update(|cx| ThreadsDatabase::connect(cx)).await.unwrap();
+        database.delete_thread(session_id.clone()).await.unwrap();
+        assert!(
+            database
+                .load_thread(session_id.clone())
+                .await
+                .unwrap()
+                .is_none(),
+            "precondition: content row should be missing before the quit flush"
+        );
+
+        // Quit through the real shutdown path so the `on_app_quit`
+        // registration is exercised, not just the flush itself.
+        cx.update(|cx| cx.shutdown());
+
+        let restored = database
+            .load_thread(session_id.clone())
+            .await
+            .unwrap()
+            .expect("thread content should be persisted to the database on quit");
+        assert_eq!(
+            restored.messages.len(),
+            1,
+            "the user message should survive the quit flush"
+        );
+        assert_eq!(
+            restored.draft_prompt,
+            Some(vec![acp::ContentBlock::from("draft in progress")]),
+            "the current draft prompt should be captured by the quit flush"
+        );
+        assert!(
+            database
+                .load_thread(empty_session_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "empty threads should not be persisted by the quit flush"
+        );
+    }
+
+    #[test]
+    fn test_ambiguous_mcp_prompt_names() {
+        // Reserving the built-in `/compact` forces a same-named MCP prompt to be
+        // server-qualified so it stays reachable; unique names stay bare.
+        let ambiguous = ambiguous_mcp_prompt_names([COMPACT_COMMAND_NAME], ["compact", "deploy"]);
+        assert!(ambiguous.contains("compact"));
+        assert!(!ambiguous.contains("deploy"));
+
+        // Without the reservation, a unique MCP prompt is left bare.
+        let ambiguous = ambiguous_mcp_prompt_names([], ["compact", "deploy"]);
+        assert!(ambiguous.is_empty());
+
+        // Two MCP prompts sharing a name are both qualified regardless of
+        // reservation.
+        let ambiguous = ambiguous_mcp_prompt_names([], ["dup", "dup", "unique"]);
+        assert!(ambiguous.contains("dup"));
+        assert!(!ambiguous.contains("unique"));
+    }
+
+    #[test]
+    fn test_qualified_compact_commands_are_not_native_compact() {
+        let unqualified_blocks = [acp::ContentBlock::from("/compact")];
+        let unqualified = Command::parse(&unqualified_blocks).unwrap();
+        assert!(unqualified.is_unqualified("compact"));
+
+        let mcp_blocks = [acp::ContentBlock::from("/server.compact")];
+        let mcp_qualified = Command::parse(&mcp_blocks).unwrap();
+        assert_eq!(mcp_qualified.prompt_name, "compact");
+        assert_eq!(mcp_qualified.explicit_server_id, Some("server"));
+        assert!(!mcp_qualified.is_unqualified("compact"));
+
+        let skill_blocks = [acp::ContentBlock::from("/:compact")];
+        let skill_qualified = Command::parse(&skill_blocks).unwrap();
+        assert_eq!(skill_qualified.prompt_name, "compact");
+        assert_eq!(skill_qualified.skill_scope, Some(""));
+        assert!(!skill_qualified.is_unqualified("compact"));
     }
 
     fn make_project_skill(name: &str, description: &str, worktree: &str) -> Skill {
@@ -3451,6 +4268,7 @@ mod internal_tests {
             },
             directory_path: PathBuf::from(format!("/{worktree}/.agents/skills/{name}")),
             skill_file_path: PathBuf::from(format!("/{worktree}/.agents/skills/{name}/SKILL.md")),
+            load_warnings: Vec::new(),
             disable_model_invocation: false,
             embedded_body: None,
         }
@@ -3463,6 +4281,7 @@ mod internal_tests {
             source: SkillSource::BuiltIn,
             directory_path: PathBuf::from(format!("/builtin/{name}")),
             skill_file_path: PathBuf::from(format!("/builtin/{name}/SKILL.md")),
+            load_warnings: Vec::new(),
             disable_model_invocation: false,
             embedded_body: Some("built-in body"),
         }
@@ -3626,10 +4445,10 @@ mod internal_tests {
     }
 
     #[test]
-    fn test_select_catalog_skills_emits_errors_for_dropped_skills() {
+    fn test_select_catalog_skills_emits_issue_for_dropped_skills() {
         // Each skill's name + description occupies ~10KB. With a 50KB
         // budget, only the first ~5 visible skills fit; the rest must
-        // appear as load errors so the UI can surface them.
+        // appear as loading issues so the UI can surface them.
         let description = "x".repeat(10 * 1024);
         let mut skills = Vec::new();
         let total = 10;
@@ -3641,12 +4460,13 @@ mod internal_tests {
                 source: SkillSource::Global,
                 directory_path: PathBuf::from(format!("/skills/{name}")),
                 skill_file_path: PathBuf::from(format!("/skills/{name}/SKILL.md")),
+                load_warnings: Vec::new(),
                 disable_model_invocation: false,
                 embedded_body: None,
             });
         }
 
-        let (kept, errors) = select_catalog_skills(&skills);
+        let (kept, issues) = select_catalog_skills(&skills);
 
         assert!(
             kept.len() < skills.len(),
@@ -3655,9 +4475,9 @@ mod internal_tests {
             skills.len(),
         );
         assert_eq!(
-            errors.len(),
+            issues.len(),
             1,
-            "all dropped skills should be consolidated into a single error, got {errors:?}",
+            "all dropped skills should be consolidated into a single issue, got {issues:?}",
         );
 
         let kept_size: usize = kept
@@ -3669,33 +4489,34 @@ mod internal_tests {
             "kept skills must fit in the budget (got {kept_size} bytes)",
         );
 
-        let error = &errors[0];
+        let issue = &issues[0];
+        assert_eq!(issue.kind, SkillLoadingIssueKind::CatalogBudgetExceeded);
         assert!(
-            error.message.contains("50KB") && error.message.contains("budget"),
-            "error message {:?} should describe the budget",
-            error.message,
+            issue.message.contains("50KB") && issue.message.contains("budget"),
+            "issue message {:?} should describe the budget",
+            issue.message,
         );
         assert_eq!(
-            error.path,
+            issue.path,
             skills[kept.len()].skill_file_path,
-            "error path should match the first dropped skill",
+            "issue path should match the first dropped skill",
         );
 
         for dropped_skill in &skills[kept.len()..total] {
             let name = &dropped_skill.name;
             assert!(
-                error.message.contains(name.as_str()),
-                "error message {:?} should mention the dropped skill name {name:?}",
-                error.message,
+                issue.message.contains(name.as_str()),
+                "issue message {:?} should mention the dropped skill name {name:?}",
+                issue.message,
             );
             let bullet_line = format!("- {name}");
             assert!(
-                error
+                issue
                     .message
                     .lines()
                     .any(|line| line.starts_with(&bullet_line)),
-                "error message {:?} should contain a bullet line starting with {bullet_line:?}",
-                error.message,
+                "issue message {:?} should contain a bullet line starting with {bullet_line:?}",
+                issue.message,
             );
         }
     }
@@ -3716,6 +4537,7 @@ mod internal_tests {
             source: SkillSource::Global,
             directory_path: PathBuf::from("/skills/skill-01-first"),
             skill_file_path: PathBuf::from("/skills/skill-01-first/SKILL.md"),
+            load_warnings: Vec::new(),
             disable_model_invocation: false,
             embedded_body: None,
         };
@@ -3725,6 +4547,7 @@ mod internal_tests {
             source: SkillSource::Global,
             directory_path: PathBuf::from("/skills/skill-02-overflows"),
             skill_file_path: PathBuf::from("/skills/skill-02-overflows/SKILL.md"),
+            load_warnings: Vec::new(),
             disable_model_invocation: false,
             embedded_body: None,
         };
@@ -3734,6 +4557,7 @@ mod internal_tests {
             source: SkillSource::Global,
             directory_path: PathBuf::from("/skills/skill-03-would-fit"),
             skill_file_path: PathBuf::from("/skills/skill-03-would-fit/SKILL.md"),
+            load_warnings: Vec::new(),
             disable_model_invocation: false,
             embedded_body: None,
         };
@@ -3749,29 +4573,30 @@ mod internal_tests {
         );
 
         let skills = vec![first.clone(), second.clone(), third.clone()];
-        let (kept, errors) = select_catalog_skills(&skills);
+        let (kept, issues) = select_catalog_skills(&skills);
 
         let kept_names: Vec<&str> = kept.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(kept_names, vec![first.name.as_str()]);
 
-        assert_eq!(errors.len(), 1, "expected a single consolidated error");
-        assert_eq!(errors[0].path, second.skill_file_path);
+        assert_eq!(issues.len(), 1, "expected a single consolidated issue");
+        assert_eq!(issues[0].kind, SkillLoadingIssueKind::CatalogBudgetExceeded);
+        assert_eq!(issues[0].path, second.skill_file_path);
         assert!(
-            errors[0].message.contains(second.name.as_str()),
-            "error message {:?} should mention {:?}",
-            errors[0].message,
+            issues[0].message.contains(second.name.as_str()),
+            "issue message {:?} should mention {:?}",
+            issues[0].message,
             second.name,
         );
         assert!(
-            errors[0].message.contains(third.name.as_str()),
-            "error message {:?} should mention {:?}",
-            errors[0].message,
+            issues[0].message.contains(third.name.as_str()),
+            "issue message {:?} should mention {:?}",
+            issues[0].message,
             third.name,
         );
         assert!(
-            errors[0].message.contains("- "),
-            "error message {:?} should use bullet form when multiple skills are dropped",
-            errors[0].message,
+            issues[0].message.contains("- "),
+            "issue message {:?} should use bullet form when multiple skills are dropped",
+            issues[0].message,
         );
     }
 
@@ -3781,7 +4606,7 @@ mod internal_tests {
         // must not appear in the catalog returned by `select_catalog_skills`,
         // even when they would otherwise fit in the budget. They also don't
         // count against the budget, so a hidden skill larger than the entire
-        // budget shouldn't generate a load error or prevent later visible
+        // budget shouldn't generate a loading issue or prevent later visible
         // skills from fitting.
         let huge_description = "y".repeat(MAX_SKILL_DESCRIPTIONS_SIZE * 2);
         let hidden = Skill {
@@ -3790,6 +4615,7 @@ mod internal_tests {
             source: SkillSource::Global,
             directory_path: PathBuf::from("/skills/hidden-huge"),
             skill_file_path: PathBuf::from("/skills/hidden-huge/SKILL.md"),
+            load_warnings: Vec::new(),
             disable_model_invocation: true,
             embedded_body: None,
         };
@@ -3799,13 +4625,14 @@ mod internal_tests {
             source: SkillSource::Global,
             directory_path: PathBuf::from("/skills/visible"),
             skill_file_path: PathBuf::from("/skills/visible/SKILL.md"),
+            load_warnings: Vec::new(),
             disable_model_invocation: false,
             embedded_body: None,
         };
 
-        let (kept, errors) = select_catalog_skills(&[hidden, visible]);
+        let (kept, issues) = select_catalog_skills(&[hidden, visible]);
 
-        assert!(errors.is_empty(), "expected no errors, got: {errors:?}");
+        assert!(issues.is_empty(), "expected no issues, got: {issues:?}");
         let kept_names: Vec<&str> = kept.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(kept_names, vec!["visible"]);
     }
@@ -3961,6 +4788,101 @@ mod internal_tests {
             assert_eq!(user.len(), 1);
             assert_eq!(user[0].description, "Second version");
         });
+    }
+
+    #[gpui::test]
+    async fn test_global_skill_with_long_description_loads_with_warning(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let skills_dir = global_skills_dir();
+        let skill_dir = skills_dir.join("long-description");
+        let skill_path = skill_dir.join("SKILL.md");
+        let long_description = "a".repeat(agent_skills::MAX_SKILL_DESCRIPTION_LEN + 1);
+        fs.create_dir(&skill_dir).await.unwrap();
+        fs.insert_file(
+            &skill_path,
+            format!("---\nname: long-description\ndescription: {long_description}\n---\n\nbody")
+                .into_bytes(),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), [], cx).await;
+        let project_id = project.entity_id();
+        let thread_store = cx.new(|cx| ThreadStore::new(cx));
+        let agent =
+            cx.update(|cx| NativeAgent::new(thread_store, Templates::new(), fs.clone(), cx));
+
+        cx.update(|cx| {
+            agent.update(cx, |agent, cx| agent.ensure_skills_scan_started(cx));
+        });
+
+        let connection = NativeAgentConnection(agent.clone());
+        let acp_thread = cx
+            .update(|cx| {
+                Rc::new(connection.clone()).new_session(
+                    project.clone(),
+                    PathList::new(&[Path::new("/")]),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        let loaded_skill = agent.read_with(cx, |agent, cx| {
+            let state = agent.projects.get(&project_id).unwrap();
+            let user = user_skills(&state.skills);
+            assert_eq!(user.len(), 1);
+            assert_eq!(user[0].name, "long-description");
+            assert_eq!(user[0].description, long_description);
+
+            let catalog_names: Vec<&str> = state
+                .project_context
+                .read(cx)
+                .skills()
+                .iter()
+                .map(|skill| skill.name.as_str())
+                .collect();
+            assert!(
+                catalog_names.contains(&"long-description"),
+                "long-description skill should remain in the model catalog: {catalog_names:?}"
+            );
+
+            assert!(
+                state.skill_loading_issues.iter().any(|issue| {
+                    issue.kind == SkillLoadingIssueKind::DescriptionTooLong
+                        && issue.path == skill_path
+                        && issue.message.to_string().contains("1024-character limit")
+                }),
+                "expected a description-length warning issue, got {:?}",
+                state.skill_loading_issues
+            );
+
+            (*user[0]).clone()
+        });
+
+        let session_id = acp_thread.read_with(cx, |thread, _cx| thread.session_id().clone());
+        cx.update(|cx| {
+            let available_skills = connection.available_skills(&session_id, cx);
+            let available_skill = available_skills
+                .iter()
+                .find(|skill| skill.name == "long-description")
+                .expect("long-description should appear in available skills");
+            assert_eq!(available_skill.description, long_description);
+            assert!(
+                available_skill
+                    .warning
+                    .as_ref()
+                    .is_some_and(|warning| warning.contains("1024-character limit")),
+                "available skill should expose warning text, got {:?}",
+                available_skill.warning
+            );
+        });
+
+        let body = agent_skills::read_skill_body(fs.as_ref(), &loaded_skill.skill_file_path)
+            .await
+            .expect("body should load despite description-length warning");
+        assert_eq!(body, "body");
     }
 
     #[gpui::test]
@@ -4362,7 +5284,7 @@ mod internal_tests {
         // Run the subagent through the production registration path.
         // This is what installs the `SkillTool` on the thread.
         let _subagent_acp = agent.update(cx, |agent, cx| {
-            agent.register_session(subagent_thread.clone(), parent_project_id, 1, cx)
+            agent.register_session(subagent_thread.clone(), parent_project_id, cx)
         });
 
         // Verify the subagent thread has the `SkillTool` installed —
@@ -4607,7 +5529,12 @@ mod internal_tests {
         cx: &mut TestAppContext,
         fs: Arc<FakeFs>,
         root: &str,
-    ) -> (Entity<NativeAgent>, Entity<Project>, WorktreeId) {
+    ) -> (
+        Entity<NativeAgent>,
+        Entity<Project>,
+        WorktreeId,
+        Entity<AcpThread>,
+    ) {
         use collections::{HashMap, HashSet};
         use project::trusted_worktrees::{self, PathTrust, TrustedWorktrees};
 
@@ -4621,7 +5548,7 @@ mod internal_tests {
             cx.update(|cx| NativeAgent::new(thread_store, Templates::new(), fs.clone(), cx));
 
         let connection = NativeAgentConnection(agent.clone());
-        let _acp_thread = cx
+        let acp_thread = cx
             .update(|cx| {
                 Rc::new(connection).new_session(
                     project.clone(),
@@ -4649,7 +5576,7 @@ mod internal_tests {
         });
         cx.run_until_parked();
 
-        (agent, project, worktree_id)
+        (agent, project, worktree_id, acp_thread)
     }
 
     /// The body resolver for a project-local skill must read the file
@@ -4677,7 +5604,7 @@ mod internal_tests {
         )
         .await;
 
-        let (agent, project, worktree_id) =
+        let (agent, project, worktree_id, _acp_thread) =
             open_trusted_project_skills(cx, fs.clone(), "/project").await;
         let project_id = project.entity_id();
 
@@ -4744,7 +5671,7 @@ mod internal_tests {
         )
         .await;
 
-        let (agent, project, _worktree_id) =
+        let (agent, project, _worktree_id, _acp_thread) =
             open_trusted_project_skills(cx, fs.clone(), "/project").await;
         let project_id = project.entity_id();
 
@@ -4760,11 +5687,12 @@ mod internal_tests {
             );
             assert!(
                 state
-                    .skill_loading_errors
+                    .skill_loading_issues
                     .iter()
-                    .any(|error| error.message.to_string().contains("maximum size")),
+                    .any(|issue| issue.kind == SkillLoadingIssueKind::LoadFailed
+                        && issue.message.to_string().contains("maximum size")),
                 "expected a size-limit error, got {:?}",
-                state.skill_loading_errors
+                state.skill_loading_issues
             );
         });
     }
@@ -4793,7 +5721,7 @@ mod internal_tests {
         )
         .await;
 
-        let (agent, project, _worktree_id) =
+        let (agent, project, _worktree_id, _acp_thread) =
             open_trusted_project_skills(cx, fs.clone(), "/project").await;
         let project_id = project.entity_id();
 
@@ -4806,11 +5734,12 @@ mod internal_tests {
             assert_eq!(names, vec!["good"], "only the valid skill should load");
             assert!(
                 state
-                    .skill_loading_errors
+                    .skill_loading_issues
                     .iter()
-                    .any(|error| error.path.ends_with("bad/SKILL.md")),
+                    .any(|issue| issue.kind == SkillLoadingIssueKind::LoadFailed
+                        && issue.path.ends_with("bad/SKILL.md")),
                 "expected an error for the malformed skill, got {:?}",
-                state.skill_loading_errors
+                state.skill_loading_issues
             );
         });
     }
@@ -4840,7 +5769,7 @@ mod internal_tests {
         )
         .await;
 
-        let (agent, project, worktree_id) =
+        let (agent, project, worktree_id, _acp_thread) =
             open_trusted_project_skills(cx, fs.clone(), "/project").await;
         let project_id = project.entity_id();
 
@@ -4936,6 +5865,7 @@ mod internal_tests {
                         ui::IconName::ZedAssistant
                     )),
                     is_latest: false,
+                    disabled: None,
                     cost: None,
                 }]
             )])
@@ -5274,11 +6204,9 @@ mod internal_tests {
         cx.run_until_parked();
 
         // Close the session so it can be reloaded from disk.
-        cx.update(|cx| connection.clone().close_session(&session_id, cx))
-            .await
-            .unwrap();
         drop(thread);
         drop(acp_thread);
+        release_dropped_entities(cx);
         agent.read_with(cx, |agent, _| {
             assert!(agent.sessions.is_empty());
         });
@@ -5377,11 +6305,9 @@ mod internal_tests {
         cx.run_until_parked();
 
         // Close the session so it can be reloaded from disk.
-        cx.update(|cx| connection.clone().close_session(&session_id, cx))
-            .await
-            .unwrap();
         drop(thread);
         drop(acp_thread);
+        release_dropped_entities(cx);
         agent.read_with(cx, |agent, _| {
             assert!(agent.sessions.is_empty());
         });
@@ -5404,6 +6330,210 @@ mod internal_tests {
                 reloaded_model.id().0.as_ref(),
                 "custom-model-id",
                 "reloaded thread should have the same model, not fall back to the default"
+            );
+        });
+
+        drop(reloaded_acp_thread);
+    }
+
+    async fn persist_thread_with_fake_corp_model(
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<NativeAgent>,
+        Rc<NativeAgentConnection>,
+        Entity<Project>,
+        acp::SessionId,
+        Arc<FakeLanguageModelProvider>,
+    ) {
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/", json!({ "a": {} })).await;
+        let project = Project::test(fs.clone(), [path!("/a").as_ref()], cx).await;
+        let thread_store = cx.new(|cx| ThreadStore::new(cx));
+        let agent = cx
+            .update(|cx| NativeAgent::new(thread_store.clone(), Templates::new(), fs.clone(), cx));
+        let connection = Rc::new(NativeAgentConnection(agent.clone()));
+
+        let model = Arc::new(FakeLanguageModel::with_id_and_thinking(
+            "fake-corp",
+            "custom-model-id",
+            "Custom Model Display Name",
+            false,
+        ));
+        let provider = Arc::new(
+            FakeLanguageModelProvider::new(
+                LanguageModelProviderId::from("fake-corp".to_string()),
+                LanguageModelProviderName::from("Fake Corp".to_string()),
+            )
+            .with_models(vec![model.clone()]),
+        );
+        cx.update(|cx| {
+            LanguageModelRegistry::global(cx).update(cx, |registry, cx| {
+                registry.register_provider(provider.clone(), cx);
+            });
+        });
+        agent.update(cx, |agent, cx| agent.models.refresh_list(cx));
+
+        let acp_thread = cx
+            .update(|cx| {
+                connection.clone().new_session(
+                    project.clone(),
+                    PathList::new(&[Path::new("/a")]),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        let session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
+
+        let selector = connection.model_selector(&session_id).unwrap();
+        cx.update(|cx| selector.select_model(AgentModelId::new("fake-corp/custom-model-id"), cx))
+            .await
+            .unwrap();
+
+        let send = acp_thread.update(cx, |thread, cx| thread.send(vec!["Hello".into()], cx));
+        let send = cx.foreground_executor().spawn(send);
+        cx.run_until_parked();
+        model.send_last_completion_stream_text_chunk("Response.");
+        model.end_last_completion_stream();
+        send.await.unwrap();
+        cx.run_until_parked();
+
+        drop(acp_thread);
+        release_dropped_entities(cx);
+
+        (agent, connection, project, session_id, provider)
+    }
+
+    fn unregister_fake_corp(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            LanguageModelRegistry::global(cx).update(cx, |registry, cx| {
+                registry.unregister_provider(
+                    LanguageModelProviderId::from("fake-corp".to_string()),
+                    cx,
+                );
+            });
+        });
+    }
+
+    #[gpui::test]
+    async fn test_loaded_thread_resolves_model_when_provider_loads_late(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (agent, _connection, project, session_id, provider) =
+            persist_thread_with_fake_corp_model(cx).await;
+
+        // Simulate a restart where the provider hasn't fetched its model list
+        // yet, so the saved selection can't be resolved at load time.
+        unregister_fake_corp(cx);
+
+        let reloaded_acp_thread = agent
+            .update(cx, |agent, cx| {
+                agent.open_thread(session_id.clone(), project.clone(), cx)
+            })
+            .await
+            .unwrap();
+        let thread = agent.read_with(cx, |agent, _| {
+            agent.sessions.get(&session_id).unwrap().thread.clone()
+        });
+        thread.read_with(cx, |thread, _| {
+            assert!(
+                thread.model().is_none(),
+                "should not fall back to an unrelated model"
+            );
+        });
+
+        // The original selection is persisted even while unresolved, so a save
+        // during the window can't overwrite the user's choice with a fallback.
+        let db_thread = thread.read_with(cx, |thread, cx| thread.to_db(cx)).await;
+        let saved = db_thread.model.expect("selection should be persisted");
+        assert_eq!(saved.provider, "fake-corp");
+        assert_eq!(saved.model, "custom-model-id");
+
+        cx.update(|cx| {
+            LanguageModelRegistry::global(cx).update(cx, |registry, cx| {
+                registry.register_provider(provider.clone(), cx);
+            });
+        });
+        cx.run_until_parked();
+
+        thread.read_with(cx, |thread, _| {
+            assert_eq!(
+                thread
+                    .model()
+                    .expect("model should resolve once provider loads")
+                    .id()
+                    .0
+                    .as_ref(),
+                "custom-model-id"
+            );
+        });
+
+        drop(reloaded_acp_thread);
+    }
+
+    #[gpui::test]
+    async fn test_explicit_model_selection_cancels_pending(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (agent, connection, project, session_id, provider) =
+            persist_thread_with_fake_corp_model(cx).await;
+
+        unregister_fake_corp(cx);
+
+        let reloaded_acp_thread = agent
+            .update(cx, |agent, cx| {
+                agent.open_thread(session_id.clone(), project.clone(), cx)
+            })
+            .await
+            .unwrap();
+        let thread = agent.read_with(cx, |agent, _| {
+            agent.sessions.get(&session_id).unwrap().thread.clone()
+        });
+        thread.read_with(cx, |thread, _| {
+            assert!(thread.model().is_none());
+        });
+
+        // The user explicitly picks a different, available model.
+        let other_model = Arc::new(FakeLanguageModel::with_id_and_thinking(
+            "other-corp",
+            "other-model-id",
+            "Other Model",
+            false,
+        ));
+        let other_provider = Arc::new(
+            FakeLanguageModelProvider::new(
+                LanguageModelProviderId::from("other-corp".to_string()),
+                LanguageModelProviderName::from("Other Corp".to_string()),
+            )
+            .with_models(vec![other_model.clone()]),
+        );
+        cx.update(|cx| {
+            LanguageModelRegistry::global(cx).update(cx, |registry, cx| {
+                registry.register_provider(other_provider, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        let selector = connection.model_selector(&session_id).unwrap();
+        cx.update(|cx| selector.select_model(AgentModelId::new("other-corp/other-model-id"), cx))
+            .await
+            .unwrap();
+
+        thread.read_with(cx, |thread, _| {
+            assert_eq!(thread.model().unwrap().id().0.as_ref(), "other-model-id");
+        });
+
+        // The original provider returning must not clobber the explicit choice.
+        cx.update(|cx| {
+            LanguageModelRegistry::global(cx).update(cx, |registry, cx| {
+                registry.register_provider(provider.clone(), cx);
+            });
+        });
+        cx.run_until_parked();
+
+        thread.read_with(cx, |thread, _| {
+            assert_eq!(
+                thread.model().unwrap().id().0.as_ref(),
+                "other-model-id",
+                "a late provider load must not override the explicit selection"
             );
         });
 
@@ -5528,11 +6658,9 @@ mod internal_tests {
         });
 
         // Close the session so it can be reloaded from disk.
-        cx.update(|cx| connection.clone().close_session(&session_id, cx))
-            .await
-            .unwrap();
         drop(thread);
         drop(acp_thread);
+        release_dropped_entities(cx);
         agent.read_with(cx, |agent, _| {
             assert_eq!(agent.sessions.keys().cloned().collect::<Vec<_>>(), []);
         });
@@ -5592,7 +6720,7 @@ mod internal_tests {
     }
 
     #[gpui::test]
-    async fn test_close_session_saves_thread(cx: &mut TestAppContext) {
+    async fn test_releasing_session_saves_thread(cx: &mut TestAppContext) {
         init_test(cx);
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(
@@ -5650,10 +6778,12 @@ mod internal_tests {
         });
 
         // Close the session immediately — no run_until_parked in between.
-        cx.update(|cx| connection.clone().close_session(&session_id, cx))
-            .await
-            .unwrap();
-        cx.run_until_parked();
+        drop(thread);
+        drop(acp_thread);
+        release_dropped_entities(cx);
+        agent.read_with(cx, |agent, _| {
+            assert!(agent.sessions.is_empty());
+        });
 
         // Reopen and verify the draft prompt was saved.
         let reloaded = agent
@@ -5666,9 +6796,182 @@ mod internal_tests {
             assert_eq!(
                 thread.draft_prompt(),
                 Some(draft_blocks.as_slice()),
-                "close_session must save the thread; draft prompt was lost"
+                "releasing the session must save the thread; draft prompt was lost"
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_releasing_thread_releases_subagent_sessions_and_project(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/",
+            json!({
+                "a": {
+                    "file.txt": "hello"
+                }
+            }),
+        )
+        .await;
+        let thread_store = cx.new(|cx| ThreadStore::new(cx));
+        let agent = cx
+            .update(|cx| NativeAgent::new(thread_store.clone(), Templates::new(), fs.clone(), cx));
+        let connection = Rc::new(NativeAgentConnection(agent.clone()));
+        let warmup_project = Project::test(fs.clone(), [path!("/a").as_ref()], cx).await;
+        drop(warmup_project);
+        release_dropped_entities(cx);
+
+        let leak_snapshot = cx.update(|cx| cx.leak_detector_snapshot());
+        let project = Project::test(fs.clone(), [path!("/a").as_ref()], cx).await;
+        let weak_project = project.downgrade();
+
+        let acp_thread = cx
+            .update(|cx| {
+                connection
+                    .clone()
+                    .new_session(project.clone(), PathList::new(&[Path::new("")]), cx)
+            })
+            .await
+            .unwrap();
+        let session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let thread = cx.update(|cx| native_thread_for_session(&agent, &session_id, cx));
+        let environment = NativeThreadEnvironment {
+            agent: agent.downgrade(),
+            thread: thread.downgrade(),
+            acp_thread: acp_thread.downgrade(),
+        };
+
+        let first_subagent = cx
+            .update(|cx| environment.create_subagent_thread("first".to_string(), cx))
+            .unwrap();
+        let second_subagent = cx
+            .update(|cx| environment.create_subagent_thread("second".to_string(), cx))
+            .unwrap();
+        cx.run_until_parked();
+
+        let session_ids = agent.read_with(cx, |agent, _| {
+            let mut ids = agent
+                .sessions
+                .keys()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            ids.sort();
+            ids
+        });
+        let mut expected_ids = vec![
+            session_id.to_string(),
+            first_subagent.id().to_string(),
+            second_subagent.id().to_string(),
+        ];
+        expected_ids.sort();
+        assert_eq!(session_ids, expected_ids);
+
+        drop(first_subagent);
+        drop(second_subagent);
+        drop(environment);
+        drop(thread);
+        drop(acp_thread);
+        drop(project);
+        release_dropped_entities(cx);
+
+        cx.update(|cx| cx.assert_no_new_leaks(&leak_snapshot));
+        let (session_count, project_count) =
+            agent.read_with(cx, |agent, _| (agent.sessions.len(), agent.projects.len()));
+        assert_eq!(session_count, 0);
+        assert_eq!(project_count, 0);
+        assert!(weak_project.upgrade().is_none());
+    }
+
+    #[gpui::test]
+    async fn test_save_burst_preserves_in_flight_write(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/",
+            json!({
+                "a": {
+                    "file.txt": "hello"
+                }
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/a").as_ref()], cx).await;
+        let thread_store = cx.new(|cx| ThreadStore::new(cx));
+        let agent = cx
+            .update(|cx| NativeAgent::new(thread_store.clone(), Templates::new(), fs.clone(), cx));
+        let connection = Rc::new(NativeAgentConnection(agent.clone()));
+
+        let acp_thread = cx
+            .update(|cx| {
+                connection
+                    .clone()
+                    .new_session(project.clone(), PathList::new(&[Path::new("")]), cx)
+            })
+            .await
+            .unwrap();
+        let session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let thread = agent.read_with(cx, |agent, _| {
+            agent.sessions.get(&session_id).unwrap().thread.clone()
+        });
+
+        let model = Arc::new(FakeLanguageModel::default());
+        thread.update(cx, |thread, cx| {
+            thread.set_model(model.clone(), cx);
+        });
+
+        let send = acp_thread.update(cx, |thread, cx| thread.send(vec!["hello".into()], cx));
+        let send = cx.foreground_executor().spawn(send);
+        cx.run_until_parked();
+
+        model.send_last_completion_stream_text_chunk("world");
+        model.end_last_completion_stream();
+        send.await.unwrap();
+        cx.run_until_parked();
+
+        let database = cx.update(|cx| ThreadsDatabase::connect(cx)).await.unwrap();
+
+        let [first_draft, second_draft, third_draft] = ["draft one", "draft two", "draft three"]
+            .map(|text| vec![acp::ContentBlock::Text(acp::TextContent::new(text))]);
+
+        let (first_gate_tx, first_gate_rx) = oneshot::channel();
+        database.set_write_gate(first_gate_rx);
+        set_draft_and_save(&agent, &acp_thread, &thread, first_draft.clone(), cx);
+        cx.run_until_parked();
+
+        set_draft_and_save(&agent, &acp_thread, &thread, second_draft, cx);
+        set_draft_and_save(&agent, &acp_thread, &thread, third_draft.clone(), cx);
+        cx.run_until_parked();
+
+        let (second_gate_tx, second_gate_rx) = oneshot::channel();
+        database.set_write_gate(second_gate_rx);
+        first_gate_tx.send(()).ok();
+        cx.run_until_parked();
+
+        let db_thread = database
+            .load_thread(session_id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            db_thread.draft_prompt,
+            Some(first_draft),
+            "save requests arriving during an in-flight write must not cancel it"
+        );
+
+        second_gate_tx.send(()).ok();
+        cx.run_until_parked();
+
+        let db_thread = database
+            .load_thread(session_id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            db_thread.draft_prompt,
+            Some(third_draft),
+            "the save worker must persist the latest snapshot of a burst"
+        );
     }
 
     #[gpui::test]
@@ -5731,25 +7034,20 @@ mod internal_tests {
         cx.run_until_parked();
 
         agent.read_with(cx, |agent, _| {
-            let session = agent
-                .sessions
-                .get(&session_id)
-                .expect("thread_summary should not close the active session");
-            assert_eq!(
-                session.ref_count, 1,
-                "thread_summary should release its temporary session reference"
+            assert!(
+                agent.sessions.contains_key(&session_id),
+                "thread_summary should not close the active session"
             );
         });
 
-        cx.update(|cx| connection.clone().close_session(&session_id, cx))
-            .await
-            .unwrap();
-        cx.run_until_parked();
+        drop(thread);
+        drop(acp_thread);
+        release_dropped_entities(cx);
 
         agent.read_with(cx, |agent, _| {
             assert!(
                 agent.sessions.is_empty(),
-                "closing the active session after thread_summary should unload it"
+                "dropping the active session after thread_summary should unload it"
             );
         });
     }
@@ -5806,11 +7104,9 @@ mod internal_tests {
         send.await.unwrap();
         cx.run_until_parked();
 
-        cx.update(|cx| connection.clone().close_session(&session_id, cx))
-            .await
-            .unwrap();
         drop(thread);
         drop(acp_thread);
+        release_dropped_entities(cx);
         agent.read_with(cx, |agent, _| {
             assert!(agent.sessions.is_empty());
         });
@@ -5845,14 +7141,13 @@ mod internal_tests {
             "concurrent loads for the same session should share one AcpThread"
         );
 
-        cx.update(|cx| connection.clone().close_session(&session_id, cx))
-            .await
-            .unwrap();
+        drop(first_loaded_thread);
+        release_dropped_entities(cx);
 
         agent.read_with(cx, |agent, _| {
             assert!(
                 agent.sessions.contains_key(&session_id),
-                "closing one loaded session should not drop shared session state"
+                "dropping one loaded handle should not drop shared session state"
             );
         });
 
@@ -5891,14 +7186,9 @@ mod internal_tests {
             );
         });
 
-        cx.update(|cx| connection.clone().close_session(&session_id, cx))
-            .await
-            .unwrap();
-
-        cx.run_until_parked();
-
-        drop(first_loaded_thread);
         drop(second_loaded_thread);
+        release_dropped_entities(cx);
+
         agent.read_with(cx, |agent, _| {
             assert!(agent.sessions.is_empty());
         });
@@ -6028,6 +7318,21 @@ mod internal_tests {
         // block, the safe behavior is to return it unchanged rather than
         // silently mangling unrelated user text.
         assert_eq!(strip_slash_command_prefix("hello world"), "hello world",);
+    }
+
+    fn set_draft_and_save(
+        agent: &Entity<NativeAgent>,
+        acp_thread: &Entity<AcpThread>,
+        thread: &Entity<Thread>,
+        draft: Vec<acp::ContentBlock>,
+        cx: &mut TestAppContext,
+    ) {
+        acp_thread.update(cx, |acp_thread, cx| {
+            acp_thread.set_draft_prompt(Some(draft), cx);
+        });
+        agent.update(cx, |agent, cx| {
+            agent.save_thread(thread.clone(), cx);
+        });
     }
 }
 

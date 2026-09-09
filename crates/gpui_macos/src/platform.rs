@@ -1,15 +1,16 @@
 use crate::{
-    BoolExt, MacDispatcher, MacDisplay, MacKeyboardLayout, MacKeyboardMapper, MacWindow,
-    events::key_to_native, ns_string, pasteboard::Pasteboard, renderer,
+    BoolExt, MacActivity, MacDispatcher, MacDisplay, MacKeyboardLayout, MacKeyboardMapper,
+    MacWindow, events::key_to_native, ns_string, pasteboard::Pasteboard, renderer,
     set_active_window_cursor_style,
 };
 use anyhow::{Context as _, anyhow};
 use block::ConcreteBlock;
 use cocoa::{
     appkit::{
-        NSApplication, NSApplicationActivationPolicy::NSApplicationActivationPolicyRegular,
-        NSControl as _, NSEventModifierFlags, NSMenu, NSMenuItem, NSModalResponse, NSOpenPanel,
-        NSSavePanel, NSVisualEffectState, NSVisualEffectView, NSWindow,
+        NSAppearanceNameVibrantDark, NSAppearanceNameVibrantLight, NSApplication,
+        NSApplicationActivationPolicy::NSApplicationActivationPolicyRegular, NSControl as _,
+        NSEventModifierFlags, NSMenu, NSMenuItem, NSModalResponse, NSOpenPanel, NSSavePanel,
+        NSVisualEffectState, NSVisualEffectView, NSWindow,
     },
     base::{BOOL, NO, YES, id, nil, selector},
     foundation::{
@@ -28,11 +29,13 @@ use ctor::ctor;
 use dispatch2::DispatchQueue;
 use futures::channel::oneshot;
 use gpui::{
-    Action, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, ForegroundExecutor,
-    KeyContext, Keymap, Menu, MenuItem, OsMenu, OwnedMenu, PathPromptOptions, Platform,
-    PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
-    PlatformWindow, Result, SystemMenuType, Task, ThermalState, WindowAppearance, WindowParams,
+    Action, ActivityGuard, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle,
+    ForegroundExecutor, KeyContext, Keymap, Menu, MenuItem, OsMenu, OwnedMenu, PathPromptOptions,
+    Platform, PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
+    PlatformWindow, Result, SystemMenuType, Task, ThermalState, WindowAppearance, WindowKind,
+    WindowParams, popup::PopupNotSupportedError,
 };
+use gpui_util::{ResultExt, new_std_command};
 use itertools::Itertools;
 use objc::{
     class,
@@ -41,6 +44,8 @@ use objc::{
     runtime::{Class, Object, Sel},
     sel, sel_impl,
 };
+use objc2::MainThreadMarker;
+use objc2_foundation::NSActivityOptions;
 use parking_lot::Mutex;
 use ptr::null_mut;
 use semver::Version;
@@ -56,10 +61,6 @@ use std::{
         Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
-};
-use util::{
-    ResultExt,
-    command::{new_command, new_std_command},
 };
 
 #[allow(non_upper_case_globals)]
@@ -154,12 +155,17 @@ unsafe fn build_classes() {
                 on_thermal_state_change as extern "C" fn(&mut Object, Sel, id),
             );
 
+            decl.add_method(
+                sel!(onSystemWake:),
+                on_system_wake as extern "C" fn(&mut Object, Sel, id),
+            );
+
             decl.register()
         }
     }
 }
 
-pub struct MacPlatform(Mutex<MacPlatformState>);
+pub struct MacPlatform(Mutex<MacPlatformState>, MainThreadMarker);
 
 pub(crate) struct MacPlatformState {
     background_executor: BackgroundExecutor,
@@ -172,7 +178,9 @@ pub(crate) struct MacPlatformState {
     reopen: Option<Box<dyn FnMut()>>,
     on_keyboard_layout_change: Option<Box<dyn FnMut()>>,
     on_thermal_state_change: Option<Box<dyn FnMut()>>,
-    quit: Option<Box<dyn FnMut()>>,
+    on_system_wake: Option<Box<dyn FnMut()>>,
+    system_wake_observer_registered: bool,
+    quit: Option<Box<dyn FnMut() -> bool>>,
     menu_command: Option<Box<dyn FnMut(&dyn Action)>>,
     validate_menu_command: Option<Box<dyn FnMut(&dyn Action) -> bool>>,
     will_open_menu: Option<Box<dyn FnMut()>>,
@@ -184,22 +192,31 @@ pub(crate) struct MacPlatformState {
     keyboard_mapper: Rc<MacKeyboardMapper>,
     /// Mirrors `[NSCursor setHiddenUntilMouseMoves:]` state, which AppKit doesn't expose.
     cursor_visible: Arc<AtomicBool>,
+    system_notifications: crate::system_notifications::SystemNotificationState,
 }
 
 impl MacPlatform {
     pub fn new(headless: bool) -> Self {
+        let marker = MainThreadMarker::new().expect("Mac platform not created on main thread");
         let dispatcher = Arc::new(MacDispatcher::new());
 
         #[cfg(feature = "font-kit")]
         let text_system = Arc::new(crate::MacTextSystem::new());
 
         #[cfg(not(feature = "font-kit"))]
-        let text_system = Arc::new(gpui::NoopTextSystem::new());
+        let text_system = {
+            if !headless {
+                log::warn!(
+                    "gpui_macos was compiled without the `font-kit` feature, so no text will be rendered."
+                );
+            }
+            Arc::new(gpui::NoopTextSystem::new())
+        };
 
         let keyboard_layout = MacKeyboardLayout::new();
         let keyboard_mapper = Rc::new(MacKeyboardMapper::new(keyboard_layout.id()));
 
-        Self(Mutex::new(MacPlatformState {
+        let state = Mutex::new(MacPlatformState {
             headless,
             text_system,
             background_executor: BackgroundExecutor::new(dispatcher.clone()),
@@ -218,10 +235,14 @@ impl MacPlatform {
             dock_menu: None,
             on_keyboard_layout_change: None,
             on_thermal_state_change: None,
+            on_system_wake: None,
+            system_wake_observer_registered: false,
             menus: None,
             keyboard_mapper,
             cursor_visible: Arc::new(AtomicBool::new(true)),
-        }))
+            system_notifications: crate::system_notifications::SystemNotificationState::new(),
+        });
+        Self(state, marker)
     }
 
     unsafe fn create_menu_bar(
@@ -520,7 +541,7 @@ impl Platform for MacPlatform {
         }
     }
 
-    fn restart(&self, binary_path: Option<PathBuf>) {
+    fn restart(&self, binary_path: Option<PathBuf>, arguments: Vec<std::ffi::OsString>) {
         use std::os::unix::process::CommandExt as _;
 
         let app_pid = std::process::id().to_string();
@@ -540,7 +561,13 @@ impl Platform for MacPlatform {
             while kill -0 $0 2> /dev/null; do
                 sleep 0.1
             done
-            open "$1"
+            app_path="$1"
+            shift
+            if (($# > 0)); then
+                open "$app_path" --args "$@"
+            else
+                open "$app_path"
+            fi
         "#;
 
         #[allow(
@@ -552,6 +579,7 @@ impl Platform for MacPlatform {
             .arg(script)
             .arg(app_pid)
             .arg(app_path)
+            .args(arguments)
             .process_group(0)
             .spawn();
 
@@ -627,6 +655,12 @@ impl Platform for MacPlatform {
         handle: AnyWindowHandle,
         options: WindowParams,
     ) -> Result<Box<dyn PlatformWindow>> {
+        // Native popups are not implemented on macOS yet. Rejecting lets callers fall back to
+        // gpui's in-window popovers.
+        if let WindowKind::AnchoredPopup(_) = options.kind {
+            return Err(PopupNotSupportedError.into());
+        }
+
         let (cursor_visible, foreground_executor, background_executor, renderer_context) = {
             let guard = self.0.lock();
             (
@@ -644,6 +678,7 @@ impl Platform for MacPlatform {
             foreground_executor,
             background_executor,
             renderer_context,
+            self.1,
         )))
     }
 
@@ -652,6 +687,29 @@ impl Platform for MacPlatform {
             let app = NSApplication::sharedApplication(nil);
             let appearance: id = msg_send![app, effectiveAppearance];
             crate::window_appearance::window_appearance_from_native(appearance)
+        }
+    }
+
+    fn set_window_appearance(&self, appearance: Option<WindowAppearance>) {
+        unsafe {
+            let app: id = msg_send![APP_CLASS, sharedApplication];
+            // `None` clears the override by setting a nil appearance, so the app
+            // falls back to tracking the system-wide light/dark setting.
+            let ns_appearance: id = match appearance {
+                None => nil,
+                Some(appearance) => {
+                    let name: id = match appearance {
+                        WindowAppearance::Light => crate::window_appearance::NSAppearanceNameAqua,
+                        WindowAppearance::Dark => {
+                            crate::window_appearance::NSAppearanceNameDarkAqua
+                        }
+                        WindowAppearance::VibrantLight => NSAppearanceNameVibrantLight,
+                        WindowAppearance::VibrantDark => NSAppearanceNameVibrantDark,
+                    };
+                    msg_send![class!(NSAppearance), appearanceNamed: name]
+                }
+            };
+            let _: () = msg_send![app, setAppearance: ns_appearance];
         }
     }
 
@@ -669,6 +727,10 @@ impl Platform for MacPlatform {
     }
 
     fn register_url_scheme(&self, scheme: &str) -> Task<anyhow::Result<()>> {
+        use block2::RcBlock;
+        use objc2_app_kit::NSWorkspace;
+        use objc2_foundation::{NSBundle, NSError, NSString};
+
         // API only available post Monterey
         // https://developer.apple.com/documentation/appkit/nsworkspace/3753004-setdefaultapplicationaturl
         let (done_tx, done_rx) = oneshot::channel();
@@ -678,43 +740,42 @@ impl Platform for MacPlatform {
             )));
         }
 
-        let bundle_id = unsafe {
-            let bundle: id = msg_send![class!(NSBundle), mainBundle];
-            let bundle_id: id = msg_send![bundle, bundleIdentifier];
-            if bundle_id == nil {
-                return Task::ready(Err(anyhow!("Can only register URL scheme in bundled apps")));
-            }
-            bundle_id
+        let Some(bundle_id) = NSBundle::mainBundle().bundleIdentifier() else {
+            return Task::ready(Err(anyhow!("Can only register URL scheme in bundled apps")));
         };
 
-        unsafe {
-            let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
-            let scheme: id = ns_string(scheme);
-            let app: id = msg_send![workspace, URLForApplicationWithBundleIdentifier: bundle_id];
-            if app == nil {
-                return Task::ready(Err(anyhow!(
-                    "Cannot register URL scheme until app is installed"
-                )));
+        let workspace = NSWorkspace::sharedWorkspace();
+        let Some(app) = workspace.URLForApplicationWithBundleIdentifier(&bundle_id) else {
+            return Task::ready(Err(anyhow!(
+                "Cannot register URL scheme until app is installed"
+            )));
+        };
+
+        let scheme = NSString::from_str(scheme);
+
+        let done_tx = Cell::new(Some(done_tx));
+        let handler = RcBlock::new(move |error: *mut NSError| {
+            let result = if let Some(error) = unsafe { error.as_ref() } {
+                Err(anyhow!(
+                    "Failed to register: {}",
+                    error.localizedDescription()
+                ))
+            } else {
+                Ok(())
+            };
+
+            if let Some(done_tx) = done_tx.take() {
+                _ = done_tx.send(result);
             }
-            let done_tx = Cell::new(Some(done_tx));
-            let block = ConcreteBlock::new(move |error: id| {
-                let result = if error == nil {
-                    Ok(())
-                } else {
-                    let msg: id = msg_send![error, localizedDescription];
-                    Err(anyhow!("Failed to register: {msg:?}"))
-                };
+        });
 
-                if let Some(done_tx) = done_tx.take() {
-                    let _ = done_tx.send(result);
-                }
-            });
-            let block = block.copy();
-            let _: () = msg_send![workspace, setDefaultApplicationAtURL: app toOpenURLsWithScheme: scheme completionHandler: block];
-        }
+        workspace.setDefaultApplicationAtURL_toOpenURLsWithScheme_completionHandler(
+            &app,
+            &scheme,
+            Some(&handler),
+        );
 
-        self.background_executor()
-            .spawn(async { done_rx.await.map_err(|e| anyhow!(e))? })
+        self.background_executor().spawn(async { done_rx.await? })
     }
 
     fn on_open_urls(&self, callback: Box<dyn FnMut(Vec<String>)>) {
@@ -873,20 +934,21 @@ impl Platform for MacPlatform {
             .lock()
             .background_executor
             .spawn(async move {
-                if let Some(mut child) = new_command("open")
+                #[allow(
+                    clippy::disallowed_methods,
+                    reason = "running on a background thread, so blocking is fine"
+                )]
+                new_std_command("open")
                     .arg("--")
                     .arg(path)
-                    .spawn()
+                    .status()
                     .context("invoking open command")
-                    .log_err()
-                {
-                    child.status().await.log_err();
-                }
+                    .log_err();
             })
             .detach();
     }
 
-    fn on_quit(&self, callback: Box<dyn FnMut()>) {
+    fn on_quit(&self, callback: Box<dyn FnMut() -> bool>) {
         self.0.lock().quit = Some(callback);
     }
 
@@ -914,6 +976,25 @@ impl Platform for MacPlatform {
         self.0.lock().on_thermal_state_change = Some(callback);
     }
 
+    fn on_system_wake(&self, callback: Box<dyn FnMut()>) {
+        let mut state = self.0.lock();
+        state.on_system_wake = Some(callback);
+        if state.system_wake_observer_registered {
+            return;
+        }
+        drop(state);
+
+        // SAFETY: APP_CLASS is registered during startup and returns the shared NSApplication.
+        unsafe {
+            let app: id = msg_send![APP_CLASS, sharedApplication];
+            let delegate: id = msg_send![app, delegate];
+            if delegate != nil {
+                register_system_wake_observer(delegate);
+                self.0.lock().system_wake_observer_registered = true;
+            }
+        }
+    }
+
     fn thermal_state(&self) -> ThermalState {
         unsafe {
             let process_info: id = msg_send![class!(NSProcessInfo), processInfo];
@@ -926,6 +1007,34 @@ impl Platform for MacPlatform {
                 _ => ThermalState::Nominal,
             }
         }
+    }
+
+    fn prevent_idle_sleep(&self, reason: &str) -> Task<Result<ActivityGuard>> {
+        Task::ready(Ok(MacActivity::begin(
+            reason,
+            NSActivityOptions::UserInitiated,
+        )))
+    }
+
+    fn show_system_notification(&self, notification: gpui::SystemNotification) {
+        let mut state = self.0.lock();
+        let executor = state.foreground_executor.clone();
+        state.system_notifications.show(&executor, notification);
+    }
+
+    fn dismiss_system_notification(&self, tag: &str) {
+        let mut state = self.0.lock();
+        let executor = state.foreground_executor.clone();
+        state.system_notifications.dismiss(&executor, tag);
+    }
+
+    fn on_system_notification_response(
+        &self,
+        callback: Box<dyn FnMut(gpui::SystemNotificationResponse)>,
+    ) {
+        let mut state = self.0.lock();
+        let executor = state.foreground_executor.clone();
+        state.system_notifications.on_response(&executor, callback);
     }
 
     fn keyboard_layout(&self) -> Box<dyn PlatformKeyboardLayout> {
@@ -1206,11 +1315,33 @@ extern "C" fn did_finish_launching(this: &mut Object, _: Sel, _: id) {
             object: process_info
         ];
 
+        let observer = this as *mut Object as id;
         let platform = get_mac_platform(this);
-        let callback = platform.0.lock().finish_launching.take();
+        let callback = {
+            let mut state = platform.0.lock();
+            if state.on_system_wake.is_some() && !state.system_wake_observer_registered {
+                register_system_wake_observer(observer);
+                state.system_wake_observer_registered = true;
+            }
+            state.finish_launching.take()
+        };
         if let Some(callback) = callback {
             callback();
         }
+    }
+}
+
+unsafe fn register_system_wake_observer(observer: id) {
+    // SAFETY: observer is an Objective-C object implementing onSystemWake:.
+    unsafe {
+        let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
+        let workspace_center: *mut Object = msg_send![workspace, notificationCenter];
+        let wake_name = ns_string("NSWorkspaceDidWakeNotification");
+        let _: () = msg_send![workspace_center, addObserver: observer
+            selector: sel!(onSystemWake:)
+            name: wake_name
+            object: nil
+        ];
     }
 }
 
@@ -1273,6 +1404,27 @@ extern "C" fn on_thermal_state_change(this: &mut Object, _: Sel, _: id) {
                 .lock()
                 .on_thermal_state_change
                 .get_or_insert(callback);
+        }
+    }
+}
+
+extern "C" fn on_system_wake(this: &mut Object, _: Sel, _: id) {
+    // SAFETY: this is the registered app delegate carrying MAC_PLATFORM_IVAR.
+    let platform = unsafe { get_mac_platform(this) };
+    let platform_ptr = platform as *const MacPlatform as *mut c_void;
+    // SAFETY: platform lives for the process lifetime while callbacks are registered.
+    unsafe {
+        DispatchQueue::main().exec_async_f(platform_ptr, on_system_wake);
+    }
+
+    extern "C" fn on_system_wake(context: *mut c_void) {
+        // SAFETY: context is the MacPlatform pointer queued above.
+        let platform = unsafe { &*(context as *const MacPlatform) };
+        let mut lock = platform.0.lock();
+        if let Some(mut callback) = lock.on_system_wake.take() {
+            drop(lock);
+            callback();
+            platform.0.lock().on_system_wake.get_or_insert(callback);
         }
     }
 }
